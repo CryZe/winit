@@ -5,14 +5,16 @@ use std::os::raw::c_void;
 use libc;
 use winapi::shared::windef::HWND;
 
-use {DeviceId, EventsLoop, Icon, MonitorId, Window, WindowBuilder};
 use platform::EventsLoop as WindowsEventsLoop;
+use {DeviceId, EventsLoop, Icon, MonitorId, Window, WindowBuilder};
 
 /// Additional methods on `EventsLoop` that are specific to Windows.
 pub trait EventsLoopExt {
     /// By default, winit on Windows will attempt to enable process-wide DPI awareness. If that's
     /// undesirable, you can create an `EventsLoop` using this function instead.
-    fn new_dpi_unaware() -> Self where Self: Sized;
+    fn new_dpi_unaware() -> Self
+    where
+        Self: Sized;
 }
 
 impl EventsLoopExt for EventsLoop {
@@ -58,6 +60,9 @@ pub trait WindowBuilderExt {
 
     /// This sets `WS_EX_NOREDIRECTIONBITMAP`.
     fn with_no_redirection_bitmap(self, flag: bool) -> WindowBuilder;
+
+    /// This activates / deactivates the capturing the raw input.
+    fn with_no_raw_input(self, flag: bool) -> WindowBuilder;
 }
 
 impl WindowBuilderExt for WindowBuilder {
@@ -76,6 +81,12 @@ impl WindowBuilderExt for WindowBuilder {
     #[inline]
     fn with_no_redirection_bitmap(mut self, flag: bool) -> WindowBuilder {
         self.platform_specific.no_redirection_bitmap = flag;
+        self
+    }
+
+    #[inline]
+    fn with_no_raw_input(mut self, flag: bool) -> WindowBuilder {
+        self.platform_specific.no_raw_input = flag;
         self
     }
 }
