@@ -185,6 +185,28 @@ impl<T: 'static> EventLoop<T> {
         }
     }
 
+    pub fn new_no_raw_input() -> EventLoop<T> {
+        main_thread_check!("new_any_thread");
+        become_dpi_aware();
+
+        let thread_id = unsafe { processthreadsapi::GetCurrentThreadId() };
+        let runner_shared = Rc::new(ELRShared::new());
+        let (thread_msg_target, thread_msg_sender) =
+            thread_event_target_window(runner_shared.clone());
+
+        EventLoop {
+            thread_msg_sender,
+            window_target: RootELW {
+                p: EventLoopWindowTarget {
+                    thread_id,
+                    thread_msg_target,
+                    runner_shared,
+                },
+                _marker: PhantomData,
+            },
+        }
+    }
+
     pub fn window_target(&self) -> &RootELW<T> {
         &self.window_target
     }

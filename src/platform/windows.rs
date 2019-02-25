@@ -38,6 +38,10 @@ pub trait EventLoopExtWindows {
     fn new_dpi_unaware_any_thread() -> Self
     where
         Self: Sized;
+
+    fn new_no_raw_input() -> Self
+    where
+        Self: Sized;
 }
 
 impl<T> EventLoopExtWindows for EventLoop<T> {
@@ -61,6 +65,14 @@ impl<T> EventLoopExtWindows for EventLoop<T> {
     fn new_dpi_unaware_any_thread() -> Self {
         EventLoop {
             event_loop: WindowsEventLoop::new_dpi_unaware_any_thread(),
+            _marker: ::std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    fn new_no_raw_input() -> Self {
+        EventLoop {
+            event_loop: WindowsEventLoop::new_no_raw_input(),
             _marker: ::std::marker::PhantomData,
         }
     }
