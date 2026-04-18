@@ -1,9 +1,11 @@
 use super::ActiveEventLoop;
+use crate::event_loop::sink::EventSink;
 use crate::window::WindowRequests;
 use crate::window::state::{WindowState, WindowType};
 use core::sync::atomic::Ordering;
 use dpi::{LogicalPosition, PhysicalInsets, PhysicalPosition, PhysicalSize, Position, Size};
 use rwh_06::RawWindowHandle;
+use sctk::compositor::{CompositorState, Region};
 use sctk::shell::WaylandSurface;
 use sctk::shell::xdg::popup::Popup as SctkPopup;
 use sctk::shell::xdg::{XdgPositioner, XdgSurface};
@@ -14,6 +16,7 @@ use wayland_client::protocol::wl_display::WlDisplay;
 use wayland_protocols::xdg::shell::client::xdg_positioner::{Anchor, Gravity};
 use winit_core::cursor::Cursor;
 use winit_core::error::{NotSupportedError, RequestError};
+use winit_core::event::{Ime, WindowEvent};
 use winit_core::monitor::{Fullscreen, MonitorHandle as CoreMonitorHandle};
 use winit_core::window::{
     CursorGrabMode, ImeCapabilities, ImeRequest, ImeRequestError, ResizeDirection, Theme,
@@ -37,6 +40,12 @@ pub struct Popup {
     /// Used for example to close the popup
     window_requests: Arc<WindowRequests>,
 
+    /// Sink for popup-generated window events.
+    window_events_sink: Arc<Mutex<EventSink>>,
+
+    /// Compositor state used for popup surface regions.
+    compositor: Arc<CompositorState>,
+
     /// Source to wake-up the event-loop for window requests.
     event_loop_awakener: calloop::ping::Ping,
 }
@@ -57,6 +66,8 @@ impl Popup {
         if let RawWindowHandle::Wayland(parent_window_handle) = parent_window_handle {
             let queue_handle = event_loop_window_target.queue_handle.clone();
             let mut state = event_loop_window_target.state.borrow_mut();
+            let window_events_sink = state.window_events_sink.clone();
+            let compositor = state.compositor_state.clone();
             let positioner = XdgPositioner::new(&state.xdg_shell)
                 .map_err(|_| error!("Failed to create positioner"))?;
             let (popup, popup_state) = if let Some(parent_window_state) = state
@@ -150,6 +161,8 @@ impl Popup {
                 popup_state,
                 window_id,
                 display: event_loop_window_target.handle.connection.display().clone(),
+                window_events_sink,
+                compositor,
                 event_loop_awakener,
                 window_requests,
             })
@@ -359,28 +372,26 @@ impl CoreWindow for Popup {
 
     #[inline]
     fn request_ime_update(&self, request: ImeRequest) -> Result<(), ImeRequestError> {
-        // let state_changed = self.popup_state.lock().unwrap().request_ime_update(request)?;
+        let state_changed = self.popup_state.lock().unwrap().request_ime_update(request)?;
 
-        // if let Some(allowed) = state_changed {
-        //     let event = WindowEvent::Ime(if allowed { Ime::Enabled } else { Ime::Disabled });
-        //     self.window_events_sink.lock().unwrap().push_window_event(event, self.window_id);
-        //     self.event_loop_awakener.ping();
-        // }
+        if let Some(allowed) = state_changed {
+            let event = WindowEvent::Ime(if allowed { Ime::Enabled } else { Ime::Disabled });
+            self.window_events_sink.lock().unwrap().push_window_event(event, self.window_id);
+            self.event_loop_awakener.ping();
+        }
 
         Ok(())
     }
 
     #[inline]
     fn ime_capabilities(&self) -> Option<ImeCapabilities> {
-        // self.popup_state.lock().unwrap().ime_allowed()
-        None
+        self.popup_state.lock().unwrap().ime_allowed()
     }
 
     fn focus_window(&self) {}
 
     fn has_focus(&self) -> bool {
-        // self.popup_state.lock().unwrap().has_focus()
-        false
+        self.popup_state.lock().unwrap().has_focus()
     }
 
     fn request_user_attention(&self, request_type: Option<UserAttentionType>) {
@@ -421,33 +432,30 @@ impl CoreWindow for Popup {
     fn set_content_protected(&self, _protected: bool) {}
 
     fn set_cursor(&self, cursor: Cursor) {
-        // let popup_state = &mut self.popup_state.lock().unwrap();
+        let popup_state = &mut self.popup_state.lock().unwrap();
 
-        // match cursor {
-        //     Cursor::Icon(icon) => popup_state.set_cursor(icon),
-        //     Cursor::Custom(cursor) => popup_state.set_custom_cursor(cursor),
-        // }
+        match cursor {
+            Cursor::Icon(icon) => popup_state.set_cursor(icon),
+            Cursor::Custom(cursor) => popup_state.set_custom_cursor(cursor),
+        }
     }
 
     fn set_cursor_position(&self, position: Position) -> Result<(), RequestError> {
-        // let scale_factor = self.scale_factor();
-        // let position = position.to_logical(scale_factor);
-        // self.popup_state
-        //     .lock()
-        //     .unwrap()
-        //     .set_cursor_position(position)
-        //     // Request redraw on success, since the state is double buffered.
-        //     .map(|_| self.request_redraw())
-        Err(RequestError::Ignored)
+        let scale_factor = self.scale_factor();
+        let position = position.to_logical(scale_factor);
+        self.popup_state
+            .lock()
+            .unwrap()
+            .set_cursor_position(position)
+            .map(|_| self.request_redraw())
     }
 
     fn set_cursor_grab(&self, mode: CursorGrabMode) -> Result<(), RequestError> {
-        // self.popup_state.lock().unwrap().set_cursor_grab(mode)
-        Err(RequestError::Ignored)
+        self.popup_state.lock().unwrap().set_cursor_grab(mode)
     }
 
     fn set_cursor_visible(&self, visible: bool) {
-        // self.popup_state.lock().unwrap().set_cursor_visible(visible);
+        self.popup_state.lock().unwrap().set_cursor_visible(visible);
     }
 
     fn drag_window(&self) -> Result<(), RequestError> {
@@ -468,18 +476,17 @@ impl CoreWindow for Popup {
     }
 
     fn set_cursor_hittest(&self, hittest: bool) -> Result<(), RequestError> {
-        // let surface = self.window.wl_surface();
+        let surface = self.popup_state.lock().unwrap().window.wl_surface().clone();
 
-        // if hittest {
-        //     surface.set_input_region(None);
-        //     Ok(())
-        // } else {
-        //     let region = Region::new(&*self.compositor).map_err(|err| os_error!(err))?;
-        //     region.add(0, 0, 0, 0);
-        //     surface.set_input_region(Some(region.wl_region()));
-        //     Ok(())
-        // }
-        Err(RequestError::Ignored)
+        if hittest {
+            surface.set_input_region(None);
+            Ok(())
+        } else {
+            let region = Region::new(&*self.compositor).map_err(|err| os_error!(err))?;
+            region.add(0, 0, 0, 0);
+            surface.set_input_region(Some(region.wl_region()));
+            Ok(())
+        }
     }
 
     fn current_monitor(&self) -> Option<CoreMonitorHandle> {
