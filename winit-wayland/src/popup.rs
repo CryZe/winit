@@ -64,6 +64,8 @@ impl Popup {
             let queue_handle = event_loop_window_target.queue_handle.clone();
             let mut state = event_loop_window_target.state.borrow_mut();
             let monitors = state.monitors.clone();
+            // Extract the parent window ID for popup_parent tracking (needed for leaf-first destruction).
+            let parent_window_id = WindowId::from_raw(parent_window_handle.surface.as_ptr() as usize);
             let xdg_activation = state
                 .xdg_activation
                 .as_ref()
@@ -73,7 +75,7 @@ impl Popup {
             let (popup, popup_state) = if let Some(parent_window_state) = state
                 .windows
                 .borrow()
-                .get(&WindowId::from_raw(parent_window_handle.surface.as_ptr() as usize))
+                .get(&parent_window_id)
             {
                 let size = attributes.surface_size.ok_or(error!("Invalid size for popup"))?;
 
@@ -117,6 +119,7 @@ impl Popup {
                     &state,
                     size,
                     WindowType::Popup { popup: popup.clone(), positioner, last_configure: None },
+                    Some(parent_window_id),
                     attributes.preferred_theme,
                     false,
                     scale_factor,

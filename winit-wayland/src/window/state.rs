@@ -1,33 +1,47 @@
 //! The state of the window, which is shared with the event-loop.
 
-use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::{
+    collections::VecDeque,
+    num::NonZeroU32,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
 
 use dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize, Size};
 use foldhash::HashSet;
-use sctk::compositor::{CompositorState, Region, SurfaceData, SurfaceDataExt};
-use sctk::globals::GlobalData;
-use sctk::reexports::client::backend::ObjectId;
-use sctk::reexports::client::protocol::wl_seat::WlSeat;
-use sctk::reexports::client::protocol::wl_shm::WlShm;
-use sctk::reexports::client::protocol::wl_surface::WlSurface;
-use sctk::reexports::client::{Proxy, QueueHandle};
-use sctk::reexports::csd_frame::{
-    DecorationsFrame, FrameAction, FrameClick, ResizeEdge, WindowState as XdgWindowState,
+use sctk::{
+    compositor::{CompositorState, Region, SurfaceData, SurfaceDataExt},
+    globals::GlobalData,
+    reexports::{
+        client::{
+            Proxy, QueueHandle,
+            backend::ObjectId,
+            protocol::{wl_seat::WlSeat, wl_shm::WlShm, wl_surface::WlSurface},
+        },
+        csd_frame::{
+            DecorationsFrame, FrameAction, FrameClick, ResizeEdge, WindowState as XdgWindowState,
+        },
+        protocols::{
+            wp::{
+                fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
+                text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3,
+                viewporter::client::wp_viewport::WpViewport,
+            },
+            xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge,
+        },
+    },
+    seat::pointer::{PointerDataExt, ThemedPointer},
+    shell::{
+        WaylandSurface,
+        xdg::{
+            XdgPositioner, XdgSurface,
+            popup::{ConfigureKind, Popup, PopupConfigure},
+            window::{DecorationMode, Window, WindowConfigure},
+        },
+    },
+    shm::{Shm, slot::SlotPool},
+    subcompositor::SubcompositorState,
 };
-use sctk::reexports::protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1;
-use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::ZwpTextInputV3;
-use sctk::reexports::protocols::wp::viewporter::client::wp_viewport::WpViewport;
-use sctk::reexports::protocols::xdg::shell::client::xdg_toplevel::ResizeEdge as XdgResizeEdge;
-use sctk::seat::pointer::{PointerDataExt, ThemedPointer};
-use sctk::shell::WaylandSurface;
-use sctk::shell::xdg::popup::{ConfigureKind, Popup, PopupConfigure};
-use sctk::shell::xdg::window::{DecorationMode, Window, WindowConfigure};
-use sctk::shell::xdg::{XdgPositioner, XdgSurface};
-use sctk::shm::Shm;
-use sctk::shm::slot::SlotPool;
-use sctk::subcompositor::SubcompositorState;
 use tracing::{info, warn};
 use wayland_protocols::xdg::toplevel_icon::v1::client::xdg_toplevel_icon_manager_v1::XdgToplevelIconManagerV1;
 use winit_core::cursor::{CursorIcon, CustomCursor as CoreCustomCursor};
@@ -36,16 +50,22 @@ use winit_core::window::{
     CursorGrabMode, ImeCapabilities, ImeRequest, ImeRequestError, ResizeDirection, Theme, WindowId,
 };
 
-use crate::event_loop::OwnedDisplayHandle;
-use crate::seat::{
-    PointerConstraintsState, TextInputClientState, WinitPointerData, WinitPointerDataExt,
-    ZwpTextInputV3Ext,
+use crate::{
+    event_loop::OwnedDisplayHandle,
+    logical_to_physical_rounded, popup,
+    seat::{
+        PointerConstraintsState, TextInputClientState, WinitPointerData, WinitPointerDataExt,
+        ZwpTextInputV3Ext,
+    },
+    state::{WindowCompositorUpdate, WinitState},
+    types::{
+        cursor::{CustomCursor, SelectedCursor, WaylandCustomCursor},
+        kwin_blur::KWinBlurManager,
+        xdg_toplevel_icon_manager::ToplevelIcon,
+    },
 };
-use crate::state::{WindowCompositorUpdate, WinitState};
 use crate::types::bgr_effects::{BgrEffectManager, SurfaceBlurEffect};
-use crate::types::cursor::{CustomCursor, SelectedCursor, WaylandCustomCursor};
-use crate::types::xdg_toplevel_icon_manager::ToplevelIcon;
-use crate::{ActiveEventLoop, logical_to_physical_rounded};
+use crate::ActiveEventLoop;
 
 #[cfg(feature = "sctk-adwaita")]
 pub type WinitFrame = sctk_adwaita::AdwaitaFrame<WinitState>;
@@ -178,6 +198,14 @@ pub struct WindowState {
     /// sends `None` for the new size in the configure.
     stateless_size: LogicalSize<u32>,
 
+    /// Client-requested stateless sizes that have not been fully observed back from the
+    /// compositor yet.
+    ///
+    /// Wayland can deliver configures for older client size requests after a newer request was
+    /// already issued. We keep the request order here so stale configures do not overwrite the
+    /// newer local size and emit a spurious resize back to an older value.
+    pending_stateless_size_requests: VecDeque<LogicalSize<u32>>,
+
     /// Initial window size provided by the user. Removed on the first
     /// configure.
     initial_size: Option<Size>,
@@ -198,6 +226,12 @@ pub struct WindowState {
     /// The underlying SCTK window.
     pub window: WindowType,
 
+    /// Wayland popups must be destroyed leaf-first.
+    ///
+    /// The event loop may observe multiple popup close requests in the same iteration, so we keep
+    /// the logical parent here and use it to process deeper popups before their ancestors.
+    popup_parent: Option<WindowId>,
+
     // NOTE: The spec says that destroying parent(`window` in our case), will unmap the
     // subsurfaces. Thus to achieve atomic unmap of the client, drop the decorations
     // frame after the `window` is dropped. To achieve that we rely on rust's struct
@@ -213,6 +247,7 @@ impl WindowState {
         winit_state: &WinitState,
         initial_size: Size,
         window: WindowType,
+        popup_parent: Option<WindowId>,
         theme: Option<Theme>,
         prefer_csd: bool,
         scale_factor: f64,
@@ -266,6 +301,7 @@ impl WindowState {
             image_pool: winit_state.image_pool.clone(),
             size: initial_size.to_logical(1.),
             stateless_size: initial_size.to_logical(1.),
+            pending_stateless_size_requests: VecDeque::new(),
             initial_size: Some(initial_size),
             text_inputs: Vec::new(),
             theme,
@@ -273,7 +309,12 @@ impl WindowState {
             transparent: false,
             viewport,
             window,
+            popup_parent,
         }
+    }
+
+    pub fn popup_parent_id(&self) -> Option<WindowId> {
+        self.popup_parent
     }
 
     /// Apply closure on the given pointer.
@@ -421,6 +462,11 @@ impl WindowState {
             }
         };
 
+        if stateless && let Some(override_size) = self.resolve_pending_stateless_configure(new_size)
+        {
+            new_size = override_size;
+        }
+
         // Apply configure bounds only when compositor let the user decide what size to pick.
         if constrain {
             let bounds = self.surface_size_bounds(&configure);
@@ -524,6 +570,25 @@ impl WindowState {
     #[inline]
     fn is_stateless(configure: &WindowConfigure) -> bool {
         !(configure.is_maximized() || configure.is_fullscreen() || configure.is_tiled())
+    }
+
+    fn resolve_pending_stateless_configure(
+        &mut self,
+        configured_size: LogicalSize<u32>,
+    ) -> Option<LogicalSize<u32>> {
+        let matched_index =
+            self.pending_stateless_size_requests.iter().position(|size| *size == configured_size);
+
+        let Some(matched_index) = matched_index else {
+            self.pending_stateless_size_requests.clear();
+            return None;
+        };
+
+        for _ in 0..=matched_index {
+            self.pending_stateless_size_requests.pop_front();
+        }
+
+        self.pending_stateless_size_requests.back().copied()
     }
 
     /// Start interacting drag resize.
@@ -809,7 +874,11 @@ impl WindowState {
         match &self.window {
             WindowType::Window { last_configure, .. } => {
                 if last_configure.as_ref().map(Self::is_stateless).unwrap_or(true) {
-                    self.resize(surface_size.to_logical(self.scale_factor()))
+                    let surface_size = surface_size.to_logical(self.scale_factor());
+                    if self.pending_stateless_size_requests.back().copied() != Some(surface_size) {
+                        self.pending_stateless_size_requests.push_back(surface_size);
+                    }
+                    self.resize(surface_size)
                 }
             },
             WindowType::Popup { popup, positioner, .. } => {
