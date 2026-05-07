@@ -340,6 +340,20 @@ impl EventLoop {
 
         for mut compositor_update in compositor_updates.drain(..) {
             let window_id = compositor_update.window_id;
+            // Popups can be created and torn down fast enough that Wayland callbacks enqueue a
+            // compositor update for a surface which has already been removed from `state.windows`
+            // by the time we drain the shared update queue here. That is expected during popup /
+            // tooltip churn and should not crash the event loop. Once the backend has dropped the
+            // window state there is nothing left to resize or rescale, so the stale update can be
+            // discarded safely.
+            let window_is_alive = self.with_state(|state| {
+                state.windows.get_mut().contains_key(&window_id)
+                    && state.window_requests.get_mut().contains_key(&window_id)
+            });
+            if !window_is_alive {
+                continue;
+            }
+
             if compositor_update.scale_changed {
                 let (physical_size, scale_factor) = self.with_state(|state| {
                     let windows = state.windows.get_mut();
