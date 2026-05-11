@@ -359,8 +359,10 @@ impl WindowState {
         // NOTE: when using fractional scaling or wl_compositor@v6 the scaling
         // should be delivered before the first configure, thus apply it to
         // properly scale the physical sizes provided by the users.
+        let mut needs_initial_resize = false;
         if let Some(initial_size) = self.initial_size.take() {
             self.size = initial_size.to_logical(self.scale_factor());
+            needs_initial_resize = true;
         }
 
         // The popup was constrained to a different size by the compositor
@@ -382,7 +384,20 @@ impl WindowState {
             return;
         }
 
-        if constrained {
+        if needs_initial_resize || constrained {
+            // Popups share the same `resize` helper as regular windows because it
+            // applies the xdg surface geometry and viewport destination, which are
+            // what make Wayland interpret the attached buffer in the intended
+            // logical coordinate space.
+            //
+            // The old code only called `resize` when the compositor constrained the
+            // popup to a different size. When the compositor accepted the requested
+            // size unchanged, the popup skipped that initial geometry / viewport
+            // setup entirely. On HiDPI Wayland systems that leaves the popup buffer
+            // effectively interpreted in physical pixels, so the popup appears too
+            // large and input coordinates drift by the scale factor. Forcing the
+            // initial resize keeps the requested size and the compositor-visible
+            // logical size in sync even when no constraint was needed.
             self.resize(new_size);
         }
     }
