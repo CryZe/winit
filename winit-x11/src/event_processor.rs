@@ -976,14 +976,19 @@ impl EventProcessor {
         // Set the timestamp.
         self.target.xconn.set_timestamp(event.time as xproto::Timestamp);
 
-        let Some(DeviceType::Mouse) = self
+        let source_type = self
             .devices
             .borrow()
             .get(&mkdid(event.sourceid as xinput::DeviceId))
-            .map(|device| device.r#type)
-        else {
+            .map(|device| device.r#type);
+
+        let is_pointer_like = matches!(
+            source_type,
+            Some(DeviceType::Mouse | DeviceType::Pen | DeviceType::Eraser)
+        );
+        if !is_pointer_like {
             return;
-        };
+        }
 
         // Deliver multi-touch events instead of emulated mouse events.
         if (event.flags & xinput2::XIPointerEmulated) != 0 {
@@ -1061,14 +1066,19 @@ impl EventProcessor {
         // Set the timestamp.
         self.target.xconn.set_timestamp(event.time as xproto::Timestamp);
 
-        let Some(DeviceType::Mouse) = self
+        let source_type = self
             .devices
             .borrow()
             .get(&mkdid(event.sourceid as xinput::DeviceId))
-            .map(|device| device.r#type)
-        else {
+            .map(|device| device.r#type);
+
+        let is_pointer_like = matches!(
+            source_type,
+            Some(DeviceType::Mouse | DeviceType::Pen | DeviceType::Eraser)
+        );
+        if !is_pointer_like {
             return;
-        };
+        }
 
         let device_id = Some(mkdid(event.deviceid as xinput::DeviceId));
         let window = event.event as xproto::Window;
@@ -1419,14 +1429,19 @@ impl EventProcessor {
             value = unsafe { value.offset(1) };
         }
 
-        let Some(DeviceType::Mouse) = self
+        let source_type = self
             .devices
             .borrow()
             .get(&mkdid(xev.sourceid as xinput::DeviceId))
-            .map(|device| device.r#type)
-        else {
+            .map(|device| device.r#type);
+
+        let is_pointer_like = matches!(
+            source_type,
+            Some(DeviceType::Mouse | DeviceType::Pen | DeviceType::Eraser)
+        );
+        if !is_pointer_like {
             return;
-        };
+        }
 
         if let Some(mouse_delta) = mouse_delta.consume() {
             app.device_event(&self.target, did, DeviceEvent::PointerMotion { delta: mouse_delta });

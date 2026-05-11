@@ -1,3 +1,5 @@
+use super::ActiveEventLoop;
+use crate::window::state::{WindowState, WindowType};
 use core::sync::atomic::Ordering;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -22,12 +24,10 @@ use winit_core::window::{
     WindowLevel,
 };
 
-use super::ActiveEventLoop;
 use super::output::MonitorHandle;
 use crate::WindowAttributesWayland;
 use crate::window::Handles;
 use crate::window::handles::WindowRequests;
-use crate::window::state::{WindowState, WindowType};
 
 #[derive(Debug)]
 pub struct Popup {
@@ -61,11 +61,12 @@ impl Popup {
         let parent_window_handle =
             attributes.parent_window().ok_or(error!("Popup without a parent is not supported!"))?;
         if let RawWindowHandle::Wayland(parent_window_handle) = parent_window_handle {
+            // Keep the logical parent window id alongside the popup state so the event loop can
+            // later destroy nested popup chains leaf-first.
+            let parent_window_id = WindowId::from_raw(parent_window_handle.surface.as_ptr() as usize);
             let queue_handle = event_loop_window_target.queue_handle.clone();
             let mut state = event_loop_window_target.state.borrow_mut();
             let monitors = state.monitors.clone();
-            // Extract the parent window ID for popup_parent tracking (needed for leaf-first destruction).
-            let parent_window_id = WindowId::from_raw(parent_window_handle.surface.as_ptr() as usize);
             let xdg_activation = state
                 .xdg_activation
                 .as_ref()
@@ -124,7 +125,6 @@ impl Popup {
                     false,
                     scale_factor,
                 );
-
                 let WindowAttributesWayland { activation_token, .. } = *attributes
                     .platform
                     .take()

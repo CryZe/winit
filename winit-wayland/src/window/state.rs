@@ -52,7 +52,7 @@ use winit_core::window::{
 
 use crate::{
     event_loop::OwnedDisplayHandle,
-    logical_to_physical_rounded, popup,
+    logical_to_physical_rounded,
     seat::{
         PointerConstraintsState, TextInputClientState, WinitPointerData, WinitPointerDataExt,
         ZwpTextInputV3Ext,
@@ -60,7 +60,6 @@ use crate::{
     state::{WindowCompositorUpdate, WinitState},
     types::{
         cursor::{CustomCursor, SelectedCursor, WaylandCustomCursor},
-        kwin_blur::KWinBlurManager,
         xdg_toplevel_icon_manager::ToplevelIcon,
     },
 };
