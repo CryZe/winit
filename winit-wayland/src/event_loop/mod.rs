@@ -1,6 +1,7 @@
 //! The event-loop routines.
 
 use std::cell::{Cell, RefCell};
+use std::cmp::Reverse;
 use std::io::Result as IOResult;
 use std::mem;
 use std::os::fd::OwnedFd;
@@ -443,6 +444,27 @@ impl EventLoop {
         // Collect the window ids
         self.with_state(|state| {
             window_ids.extend(state.window_requests.get_mut().keys());
+        });
+
+        self.with_state(|state| {
+            let windows = state.windows.get_mut();
+            // Close deeper popup chains first. Wayland reports a protocol error if an ancestor
+            // popup is destroyed while one of its descendants is still considered the top-most
+            // popup by the compositor.
+            window_ids.sort_by_key(|window_id| {
+                let mut depth = 0;
+                let mut current_id = *window_id;
+
+                while let Some(parent_id) = windows
+                    .get(&current_id)
+                    .and_then(|window| window.lock().unwrap().popup_parent_id())
+                {
+                    depth += 1;
+                    current_id = parent_id;
+                }
+
+                Reverse(depth)
+            });
         });
 
         for window_id in window_ids.iter() {

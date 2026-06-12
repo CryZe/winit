@@ -198,6 +198,12 @@ pub struct WindowState {
     /// The underlying SCTK window.
     pub window: WindowType,
 
+    /// Wayland popups must be destroyed leaf-first.
+    ///
+    /// The event loop may observe multiple popup close requests in the same iteration, so we keep
+    /// the logical parent here and use it to process deeper popups before their ancestors.
+    popup_parent: Option<WindowId>,
+
     // NOTE: The spec says that destroying parent(`window` in our case), will unmap the
     // subsurfaces. Thus to achieve atomic unmap of the client, drop the decorations
     // frame after the `window` is dropped. To achieve that we rely on rust's struct
@@ -213,6 +219,7 @@ impl WindowState {
         winit_state: &WinitState,
         initial_size: Size,
         window: WindowType,
+        popup_parent: Option<WindowId>,
         theme: Option<Theme>,
         prefer_csd: bool,
         scale_factor: f64,
@@ -273,7 +280,12 @@ impl WindowState {
             transparent: false,
             viewport,
             window,
+            popup_parent,
         }
+    }
+
+    pub fn popup_parent_id(&self) -> Option<WindowId> {
+        self.popup_parent
     }
 
     /// Apply closure on the given pointer.

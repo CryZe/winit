@@ -106,6 +106,7 @@ impl Window {
             &state,
             size,
             state::WindowType::Window { window: window.clone(), last_configure: None },
+            None,
             attributes.preferred_theme,
             prefer_csd,
             scale_factor,
