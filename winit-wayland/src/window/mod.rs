@@ -132,6 +132,7 @@ impl Window {
             &state,
             size,
             state::WindowType::Window((window.clone(), None)),
+            None,
             attributes.preferred_theme,
             prefer_csd,
             scale_factor,

@@ -1,33 +1,45 @@
 //! The event-loop routines.
 
-use std::cell::{Cell, RefCell};
-use std::io::Result as IOResult;
-use std::mem;
-use std::os::fd::OwnedFd;
-use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::{
+    cell::{Cell, RefCell},
+    cmp::Reverse,
+    io::Result as IOResult,
+    mem,
+    os::{
+        fd::OwnedFd,
+        unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd},
+    },
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::JoinHandle,
+    time::{Duration, Instant},
+};
 
 use calloop::ping::Ping;
 use dpi::LogicalSize;
-use rustix::event::{PollFd, PollFlags};
-use rustix::pipe::{self, PipeFlags};
-use sctk::reexports::calloop_wayland_source::WaylandSource;
-use sctk::reexports::client::{Connection, QueueHandle, globals};
-use tracing::warn;
-use winit_core::application::ApplicationHandler;
-use winit_core::cursor::{CustomCursor as CoreCustomCursor, CustomCursorSource};
-use winit_core::error::{EventLoopError, NotSupportedError, OsError, RequestError};
-use winit_core::event::{DeviceEvent, StartCause, SurfaceSizeWriter, WindowEvent};
-use winit_core::event_loop::pump_events::PumpStatus;
-use winit_core::event_loop::{
-    ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents,
-    OwnedDisplayHandle as CoreOwnedDisplayHandle,
+use rustix::{
+    event::{PollFd, PollFlags},
+    pipe::{self, PipeFlags},
 };
-use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
-use winit_core::window::Theme;
+use sctk::reexports::{
+    calloop_wayland_source::WaylandSource,
+    client::{Connection, QueueHandle, globals},
+};
+use tracing::warn;
+use winit_core::{
+    application::ApplicationHandler,
+    cursor::{CustomCursor as CoreCustomCursor, CustomCursorSource},
+    error::{EventLoopError, NotSupportedError, OsError, RequestError},
+    event::{DeviceEvent, StartCause, SurfaceSizeWriter, WindowEvent},
+    event_loop::{
+        ActiveEventLoop as RootActiveEventLoop, ControlFlow, DeviceEvents,
+        OwnedDisplayHandle as CoreOwnedDisplayHandle, pump_events::PumpStatus,
+    },
+    monitor::MonitorHandle as CoreMonitorHandle,
+    window::Theme,
+};
 
 use crate::types::cursor::WaylandCustomCursor;
 
@@ -38,10 +50,12 @@ use proxy::EventLoopProxy;
 use sink::EventSink;
 pub use winit_core::event_loop::EventLoopProxy as CoreEventLoopProxy;
 
-use super::output::MonitorHandle;
-use super::state::{WindowCompositorUpdate, WinitState};
-use super::window::state::FrameCallbackState;
-use super::{WindowId, logical_to_physical_rounded};
+use super::{
+    WindowId, logical_to_physical_rounded,
+    output::MonitorHandle,
+    state::{WindowCompositorUpdate, WinitState},
+    window::state::FrameCallbackState,
+};
 
 type WaylandDispatcher = calloop::Dispatcher<'static, WaylandSource<WinitState>, WinitState>;
 
@@ -457,6 +471,27 @@ impl EventLoop {
         // Collect the window ids
         self.with_state(|state| {
             window_ids.extend(state.window_requests.get_mut().keys());
+        });
+
+        self.with_state(|state| {
+            let windows = state.windows.get_mut();
+            // Close deeper popup chains first. Wayland reports a protocol error if an ancestor
+            // popup is destroyed while one of its descendants is still considered the top-most
+            // popup by the compositor.
+            window_ids.sort_by_key(|window_id| {
+                let mut depth = 0;
+                let mut current_id = *window_id;
+
+                while let Some(parent_id) = windows
+                    .get(&current_id)
+                    .and_then(|window| window.lock().unwrap().popup_parent_id())
+                {
+                    depth += 1;
+                    current_id = parent_id;
+                }
+
+                Reverse(depth)
+            });
         });
 
         for window_id in window_ids.iter() {
