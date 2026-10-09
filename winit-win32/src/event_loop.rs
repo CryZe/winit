@@ -1103,11 +1103,14 @@ unsafe fn lose_active_focus(window: HWND, userdata: &WindowData) {
 /// Repositions any anchored windows owned by `parent`. Win32 does not reposition owned windows
 /// when their owner moves (unlike Wayland subsurfaces or X11's override-redirect popups), so this
 /// has to be done manually whenever `parent` receives a `WM_WINDOWPOSCHANGED` that moved it.
-unsafe fn reposition_owned_windows(parent: HWND) {
+unsafe fn reposition_owned_windows(parent: HWND, parent_scale: f64) {
     unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
         use windows_sys::Win32::UI::WindowsAndMessaging::GWL_WNDPROC;
 
-        if unsafe { GetWindow(hwnd, GW_OWNER) } != lparam as HWND {
+        // EnumThreadWindows invokes this callback synchronously, so the stack context
+        // remains valid throughout the enumeration.
+        let (parent, parent_scale) = unsafe { &*(lparam as *const (HWND, f64)) };
+        if unsafe { GetWindow(hwnd, GW_OWNER) } != *parent {
             return true.into(); // continue enumeration
         }
 
@@ -1122,15 +1125,16 @@ unsafe fn reposition_owned_windows(parent: HWND) {
         if !userdata_ptr.is_null() {
             let userdata = unsafe { &*userdata_ptr };
             if userdata.window_state_lock().window_flags.contains(WindowFlags::ANCHORED) {
-                window::reposition_owned_popup(hwnd, &userdata.window_state);
+                window::reposition_owned_popup(hwnd, &userdata.window_state, *parent_scale);
             }
         }
 
         true.into() // continue enumeration
     }
 
+    let context = (parent, parent_scale);
     unsafe {
-        EnumThreadWindows(GetCurrentThreadId(), Some(enum_proc), parent as LPARAM);
+        EnumThreadWindows(GetCurrentThreadId(), Some(enum_proc), &context as *const _ as LPARAM);
     }
 }
 
@@ -1472,7 +1476,11 @@ unsafe fn public_window_callback_inner(
                     unsafe { PhysicalPosition::new((*windowpos).x, (*windowpos).y) };
                 userdata.send_window_event(window, Moved(physical_position));
 
-                unsafe { reposition_owned_windows(window) };
+                // During WM_DPICHANGED, the nested SetWindowPos can deliver this message
+                // before GetDpiForWindow reflects the new DPI. Our state already contains
+                // the new scale; pass it on so owned popup anchors use the updated units.
+                let scale_factor = userdata.window_state_lock().scale_factor;
+                unsafe { reposition_owned_windows(window, scale_factor) };
             }
 
             // This is necessary for us to still get sent WM_SIZE.
@@ -2497,6 +2505,11 @@ unsafe fn public_window_callback_inner(
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 )
             };
+
+            // A pure DPI change may deliver WM_WINDOWPOSCHANGED with SWP_NOMOVE, or
+            // deliver the move before the DPI change. Refresh the anchored children
+            // after applying the new scale even when the physical origin stays fixed.
+            unsafe { reposition_owned_windows(window, new_scale_factor) };
 
             result = ProcResult::Value(0);
         },

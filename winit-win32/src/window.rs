@@ -7,9 +7,7 @@ use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{io, panic, ptr};
 
-use dpi::{
-    LogicalPosition, LogicalSize, PhysicalInsets, PhysicalPosition, PhysicalSize, Position, Size,
-};
+use dpi::{LogicalSize, PhysicalInsets, PhysicalPosition, PhysicalSize, Position, Size};
 use tracing::warn;
 use windows_sys::Win32::Foundation::{
     HWND, LPARAM, OLE_E_WRONGCOMPOBJ, POINT, POINTS, RECT, RPC_E_CHANGED_MODE, S_OK, WPARAM,
@@ -23,7 +21,8 @@ use windows_sys::Win32::Graphics::Dwm::{
 use windows_sys::Win32::Graphics::Gdi::{
     CDS_FULLSCREEN, ChangeDisplaySettingsExW, ClientToScreen, CreateRectRgn, DISP_CHANGE_BADFLAGS,
     DISP_CHANGE_BADMODE, DISP_CHANGE_BADPARAM, DISP_CHANGE_FAILED, DISP_CHANGE_SUCCESSFUL,
-    DeleteObject, InvalidateRgn, RDW_INTERNALPAINT, RedrawWindow, ScreenToClient,
+    DeleteObject, InvalidateRgn, MONITOR_DEFAULTTONEAREST, MonitorFromRect, RDW_INTERNALPAINT,
+    RedrawWindow, ScreenToClient,
 };
 use windows_sys::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -165,15 +164,19 @@ impl Window {
             let window_state = self.window_state_lock();
             (window_state.anchored, window_state.positioner)
         };
-        let Some((origin, size, current_size)) =
-            compute_anchored_placement(self.hwnd(), anchored, &positioner, self.scale_factor())
-        else {
+        let Some((origin, size, current_size)) = compute_anchored_placement(
+            self.hwnd(),
+            anchored,
+            &positioner,
+            self.scale_factor(),
+            None,
+        ) else {
             return;
         };
 
-        self.set_outer_position(Position::Logical(origin));
+        self.set_outer_position(Position::Physical(origin));
         if size != current_size {
-            let _ = self.request_surface_size(Size::Logical(size));
+            let _ = self.request_surface_size(Size::Physical(size));
         }
     }
 
@@ -1276,12 +1279,26 @@ fn translate_outer_position(
     PhysicalPosition::new(point.x, point.y)
 }
 
+/// Locate the anchor in desktop pixels using its parent's coordinate system. A popup's
+/// own monitor/DPI is not a reliable input: before its first placement it may still be on
+/// the primary display, and after its parent moves it may still be on the previous one.
+fn anchor_rect_on_screen(parent: HWND, positioner: &WindowPositioner, scale_factor: f64) -> RECT {
+    let mut origin = POINT { x: 0, y: 0 };
+    unsafe { ClientToScreen(parent, &mut origin) };
+    let position = positioner.anchor_rect.0.to_physical::<i32>(scale_factor);
+    let size = positioner.anchor_rect.1.to_physical::<i32>(scale_factor);
+    let offset = positioner.offset.to_physical::<i32>(scale_factor);
+    let left = origin.x + position.x + offset.x;
+    let top = origin.y + position.y + offset.y;
+    RECT { left, top, right: left + size.width.max(1), bottom: top + size.height.max(1) }
+}
+
 /// Computes an anchored window's new outer position and surface size from its positioner state,
 /// using [`winit_common::positioner::place_window`]. Returns `None` if the window isn't anchored,
 /// or its monitor's work area can't be determined.
 ///
 /// On success, returns `(origin, size, current_size)`:
-/// - `origin`: the window's new outer position, in logical coordinates relative to the parent's
+/// - `origin`: the window's new outer position, in physical coordinates relative to the parent's
 ///   content area, or to the screen if this window has no parent
 /// - `size`: the window's new surface size, as constrained by [`place_window`] and converted back
 ///   from the outer size it operates on (see below)
@@ -1292,12 +1309,24 @@ fn compute_anchored_placement(
     anchored: bool,
     positioner: &WindowPositioner,
     scale_factor: f64,
-) -> Option<(LogicalPosition<f64>, LogicalSize<f64>, LogicalSize<f64>)> {
+    parent_scale: Option<f64>,
+) -> Option<(PhysicalPosition<i32>, PhysicalSize<u32>, PhysicalSize<u32>)> {
     if !anchored {
         return None;
     }
 
-    let monitor = monitor::current_monitor(hwnd);
+    let parent = unsafe { GetParent(hwnd) };
+    let parent_scale =
+        parent_scale.unwrap_or_else(|| dpi_to_scale_factor(unsafe { hwnd_dpi(parent) }));
+    let monitor = if parent.is_null() {
+        monitor::current_monitor(hwnd)
+    } else {
+        // Constrain to the display containing the requested anchor, not the popup's
+        // previous location. Otherwise SLIDE can pin a new popup to the primary display
+        // or keep it there when its owner moves to another monitor.
+        let anchor = anchor_rect_on_screen(parent, positioner, parent_scale);
+        MonitorHandle::new(unsafe { MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST) })
+    };
     // Clip to the monitor's work area rather than its full bounds, so anchored popups don't get
     // placed underneath the taskbar.
     let (work_area_position, work_area_size) = monitor.work_area()?;
@@ -1309,35 +1338,48 @@ fn compute_anchored_placement(
     // parent, both the anchor rect and `set_outer_position` operate directly in screen
     // coordinates instead, so the origin is left at zero and the clip region stays in screen
     // space.
-    let parent = unsafe { GetParent(hwnd) };
     let mut parent_origin = POINT { x: 0, y: 0 };
     if !parent.is_null() {
         unsafe { ClientToScreen(parent, &mut parent_origin) };
     }
 
+    let target_scale = monitor.scale_factor();
     let clip_position = PhysicalPosition::new(
         work_area_position.x - parent_origin.x,
         work_area_position.y - parent_origin.y,
     )
-    .to_logical::<f64>(scale_factor);
-    let clip_size = work_area_size.to_logical::<f64>(scale_factor);
+    .to_logical::<f64>(target_scale);
+    let clip_size = work_area_size.to_logical::<f64>(target_scale);
 
     let current_outer_size = outer_size_of(hwnd).to_logical::<f64>(scale_factor);
-    let current_size = surface_size_of(hwnd).to_logical::<f64>(scale_factor);
+    let current_size = surface_size_of(hwnd);
+    let current_logical_size = current_size.to_logical::<f64>(scale_factor);
 
+    // Anchor coordinates belong to the parent, while the popup's logical size belongs
+    // to its own DPI. Keep those conversions separate when the parent straddles monitors
+    // or moves between displays with different scales. Resolve against the destination
+    // DPI, since moving the popup will synchronously send WM_DPICHANGED.
+    let mut positioner = *positioner;
+    if !parent.is_null() {
+        positioner.anchor_rect = (
+            positioner.anchor_rect.0.to_physical::<i32>(parent_scale).into(),
+            positioner.anchor_rect.1.to_physical::<u32>(parent_scale).into(),
+        );
+        positioner.offset = positioner.offset.to_physical::<i32>(parent_scale).into();
+    }
     let (origin, outer_size) =
-        place_window(positioner, scale_factor, current_outer_size, (clip_position, clip_size));
+        place_window(&positioner, target_scale, current_outer_size, (clip_position, clip_size));
 
     // The window's non-client insets (title bar, borders, ...), assumed constant regardless of
     // the window's size, to translate `outer_size` back into a surface size.
-    let insets_width = current_outer_size.width - current_size.width;
-    let insets_height = current_outer_size.height - current_size.height;
+    let insets_width = current_outer_size.width - current_logical_size.width;
+    let insets_height = current_outer_size.height - current_logical_size.height;
     let size = LogicalSize::new(
         (outer_size.width - insets_width).max(0.0),
         (outer_size.height - insets_height).max(0.0),
     );
 
-    Some((origin, size, current_size))
+    Some((origin.to_physical(target_scale), size.to_physical(target_scale), current_size))
 }
 
 /// Repositions (and, if constrained, resizes) the popup with the given `hwnd`, using its
@@ -1348,20 +1390,24 @@ fn compute_anchored_placement(
 /// thread (from a sibling window's message procedure while handling the parent's
 /// `WM_WINDOWPOSCHANGED`), so it's safe to update the OS window and `WindowState` directly
 /// instead of going through `EventLoopThreadExecutor`
-pub(crate) fn reposition_owned_popup(hwnd: HWND, window_state: &Mutex<WindowState>) {
+pub(crate) fn reposition_owned_popup(
+    hwnd: HWND,
+    window_state: &Mutex<WindowState>,
+    parent_scale: f64,
+) {
     let (anchored, positioner, scale_factor) = {
         let state = window_state.lock().unwrap();
         (state.anchored, state.positioner, state.scale_factor)
     };
 
     let Some((origin, size, current_size)) =
-        compute_anchored_placement(hwnd, anchored, &positioner, scale_factor)
+        compute_anchored_placement(hwnd, anchored, &positioner, scale_factor, Some(parent_scale))
     else {
         return;
     };
 
     let position =
-        translate_outer_position(hwnd, window_state, Position::Logical(origin), scale_factor);
+        translate_outer_position(hwnd, window_state, Position::Physical(origin), scale_factor);
     WindowState::set_window_flags(window_state.lock().unwrap(), hwnd, |f| {
         f.set(WindowFlags::MAXIMIZED, false)
     });
@@ -1379,9 +1425,8 @@ pub(crate) fn reposition_owned_popup(hwnd: HWND, window_state: &Mutex<WindowStat
     }
 
     if size != current_size {
-        let physical_size = Size::Logical(size).to_physical::<u32>(scale_factor);
         let window_flags = window_state.lock().unwrap().window_flags;
-        window_flags.set_size(hwnd, physical_size);
+        window_flags.set_size(hwnd, size);
     }
 }
 
@@ -1655,6 +1700,24 @@ unsafe fn init(
         },
     };
 
+    // Create anchored windows on the anchor's display so their initial DPI and logical
+    // size are correct before WM_CREATE and the first positioner calculation. CW_USEDEFAULT
+    // starts a WS_POPUP at (0, 0), which gives it the primary display's scale factor even
+    // when its parent and anchor are on a different monitor.
+    let initial_position = if anchored
+        && !window_flags.contains(WindowFlags::CHILD)
+        && let Some(parent) = parent
+    {
+        let anchor = anchor_rect_on_screen(
+            parent,
+            &attributes.positioner.unwrap_or_default(),
+            dpi_to_scale_factor(unsafe { hwnd_dpi(parent) }),
+        );
+        (anchor.left, anchor.top)
+    } else {
+        (CW_USEDEFAULT, CW_USEDEFAULT)
+    };
+
     let menu = win_attributes.menu;
     let fullscreen = attributes.fullscreen.clone();
     let maximized = attributes.maximized;
@@ -1667,8 +1730,8 @@ unsafe fn init(
             class_name.as_ptr(),
             title.as_ptr(),
             style,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            initial_position.0,
+            initial_position.1,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             parent.unwrap_or(ptr::null_mut()),
