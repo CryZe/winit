@@ -1,4 +1,7 @@
-//! The state of the window, which is shared with the event-loop.
+//! Native window resources shared with the event loop. Popup state retains its
+//! parent state until its own protocol role and surface have been released;
+//! callers must register the parent before constructing a child. Application
+//! callbacks and event-loop scheduling remain outside this module.
 
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, Weak};
@@ -179,6 +182,16 @@ pub struct WindowState {
 
     /// Children of this window like popups, dialogs or other windows
     children: Vec<WindowId>,
+
+    /// Keep the parent's protocol resources alive until this state's resources
+    /// have been dropped. After the event loop stops, its windows HashMap can
+    /// release entries in any order; a parent ID alone cannot ensure the
+    /// descendant-first destruction required by xdg_popup.destroy. This field
+    /// follows the child surface and decorations so Rust's field drop order
+    /// enforces that requirement even during implicit event-loop destruction.
+    /// Only children retain parents, and a parent must already be registered,
+    /// so these references cannot form a cycle. No parent lock is held on drop.
+    _parent_state: Option<Arc<Mutex<WindowState>>>,
 }
 
 impl WindowState {
@@ -253,6 +266,14 @@ impl WindowState {
             window,
             children: Default::default(),
             parent,
+            _parent_state: parent.map(|parent| {
+                winit_state
+                    .windows
+                    .borrow()
+                    .get(&parent)
+                    .expect("popup parent is registered before child state construction")
+                    .clone()
+            }),
         }
     }
 
