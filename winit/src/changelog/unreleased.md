@@ -42,6 +42,9 @@ changelog entry.
 
 ### Fixed
 
+- On macOS, keep `Window::set_visible(true)` from stealing keyboard focus. Use
+  `Window::focus_window` when showing a window should also focus it.
+
 - On Windows, keep composition keystrokes, including Korean IME's closing Escape,
   from also being delivered as application keyboard input.
 
