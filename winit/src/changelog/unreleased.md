@@ -40,7 +40,16 @@ changelog entry.
 
 ## Unreleased
 
+### Added
+
+- On macOS, implement `Window::drag_resize_window` for resizable borderless
+  windows outside fullscreen, preserving size constraints and resize increments.
+
 ### Fixed
+
+- On macOS, validate `Window::drag_window` against the originating mouse press
+  and live button state before starting a native move. Multi-click presses do
+  not start a move, matching AppKit background dragging without its warning.
 
 - On macOS, keep `Window::set_visible(true)` from stealing keyboard focus. Use
   `Window::focus_window` when showing a window should also focus it.

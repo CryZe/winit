@@ -158,6 +158,7 @@ define_class!(
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _: Option<&AnyObject>) {
             let _entered = debug_span!("windowWillClose:").entered();
+            self.view().cancel_resize();
             // `setDelegate:` retains the previous value and then autoreleases it
             autoreleasepool(|_| {
                 // Since El Capitan, we need to be careful that delegate methods can't
@@ -226,6 +227,7 @@ define_class!(
         #[unsafe(method(windowDidResignKey:))]
         fn window_did_resign_key(&self, _: Option<&AnyObject>) {
             let _entered = debug_span!("windowDidResignKey:").entered();
+            self.view().cancel_resize();
             // It happens rather often, e.g. when the user is Cmd+Tabbing, that the
             // NSWindowDelegate will receive a didResignKey event despite no event
             // being received when the modifiers are released. This is because
@@ -1273,7 +1275,10 @@ impl WindowDelegate {
                 // when they also intend to change input focus.
                 self.window().orderFront(None);
             },
-            false => self.window().orderOut(None),
+            false => {
+                self.view().cancel_resize();
+                self.window().orderOut(None);
+            },
         }
     }
 
@@ -1570,6 +1575,9 @@ impl WindowDelegate {
 
     #[inline]
     pub fn set_resizable(&self, resizable: bool) {
+        if !resizable {
+            self.view().cancel_resize();
+        }
         self.ivars().resizable.set(resizable);
         let fullscreen = self.ivars().fullscreen.borrow().is_some();
         if !fullscreen {
@@ -1706,17 +1714,23 @@ impl WindowDelegate {
 
     #[inline]
     pub fn drag_window(&self) -> Result<(), RequestError> {
-        let mtm = MainThreadMarker::from(self);
-        let event = NSApplication::sharedApplication(mtm)
-            .currentEvent()
-            .expect("could not find current event");
-        self.window().performWindowDragWithEvent(&event);
+        self.view().begin_window_move()?;
         Ok(())
     }
 
     #[inline]
-    pub fn drag_resize_window(&self, _direction: ResizeDirection) -> Result<(), NotSupportedError> {
-        Err(NotSupportedError::new("drag_resize_window is not supported"))
+    pub fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), NotSupportedError> {
+        let style = self.window().styleMask();
+        if !style.contains(NSWindowStyleMask::Resizable)
+            || style.contains(NSWindowStyleMask::Titled)
+            || self.ivars().fullscreen.borrow().is_some()
+            || self.ivars().is_simple_fullscreen.get()
+        {
+            return Err(NotSupportedError::new(
+                "programmatic resize requires a resizable borderless window outside fullscreen",
+            ));
+        }
+        self.view().begin_resize(direction, self.ivars().surface_resize_increments.get())
     }
 
     #[inline]
