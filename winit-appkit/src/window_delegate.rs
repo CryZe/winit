@@ -1266,7 +1266,13 @@ impl WindowDelegate {
 
     pub fn set_visible(&self, visible: bool) {
         match visible {
-            true => self.window().makeKeyAndOrderFront(None),
+            true => {
+                // Visibility and keyboard focus are separate operations. Making every shown
+                // window key steals focus for inactive windows and non-activating popup panels.
+                // Creation already honors `active`; callers can explicitly use `focus_window`
+                // when they also intend to change input focus.
+                self.window().orderFront(None);
+            },
             false => self.window().orderOut(None),
         }
     }

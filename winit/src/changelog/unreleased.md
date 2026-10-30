@@ -42,6 +42,9 @@ changelog entry.
 
 ### Fixed
 
+- On macOS, keep `Window::set_visible(true)` from stealing keyboard focus. Use
+  `Window::focus_window` when showing a window should also focus it.
+
 - On Windows, withhold real key presses observed during IME preedit, including
   modifiers, and `VK_PROCESSKEY` presses from `KeyboardInput` through their matching
   releases, allowing ordinary editing repeats after composition hands input back.
