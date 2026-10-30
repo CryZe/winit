@@ -124,6 +124,106 @@ pub trait WindowExtMacOS {
     /// Sets whether or not the window has shadow.
     fn set_has_shadow(&self, has_shadow: bool);
 
+    /// Sets the native keyboard requirement of winit's view when clicked.
+    ///
+    /// This overrides the read-only [`needsPanelToBecomeKey`] response of the
+    /// `ns_view` exposed by the window handle. Winit installs that view inside a
+    /// plain `NSWindow.contentView` wrapper; the wrapper and other native subviews
+    /// retain their own responses.
+    ///
+    /// For nonactivating panels, AppKit uses the hit view's response when the
+    /// panel's [`becomesKeyOnlyIfNeeded`] property is enabled. Windows created
+    /// with [`WindowAttributesMacOS::with_panel`] set to `true`, and inactive
+    /// `WindowType::Popup` windows, are nonactivating panels. Neither winit nor this
+    /// setter enables `becomesKeyOnlyIfNeeded`.
+    /// Applications configure that separate native panel property themselves.
+    /// The view response can also affect whether a click makes it first responder
+    /// in an ordinary window. It does not change the window's ability to become
+    /// key or prevent an explicit [`Window::focus_window`] request.
+    ///
+    /// Use `false` for passive content whose keyboard input remains in another
+    /// window, and `true` for editable content or controls that require keyboard
+    /// navigation. This policy is independent of whether IME events are enabled.
+    /// Until this setter is called, the view inherits AppKit's response, which
+    /// may depend on the view and system configuration. Once set, the override
+    /// persists until this setter is called again.
+    ///
+    /// [`needsPanelToBecomeKey`]: https://developer.apple.com/documentation/appkit/nsview/needspaneltobecomekey
+    /// [`becomesKeyOnlyIfNeeded`]: https://developer.apple.com/documentation/appkit/nspanel/becomeskeyonlyifneeded
+    fn set_needs_panel_to_become_key(&self, needs_key: bool);
+
+    /// Returns the current panel keyboard requirement of winit's `ns_view`.
+    ///
+    /// See [`WindowExtMacOS::set_needs_panel_to_become_key`].
+    ///
+    /// This example needs a macOS WindowServer and its own main thread.
+    /// It is ignored in the default hermetic test run.
+    ///
+    /// ```ignore,standalone_crate
+    /// use objc2_app_kit::{NSPanel, NSView};
+    /// use rwh_06::{HasWindowHandle, RawWindowHandle};
+    /// use winit_appkit::{
+    ///     EventLoop, PlatformSpecificEventLoopAttributes, WindowAttributesMacOS, WindowExtMacOS,
+    /// };
+    /// use winit_core::{
+    ///     application::ApplicationHandler,
+    ///     event::WindowEvent,
+    ///     event_loop::ActiveEventLoop,
+    ///     window::{WindowAttributes, WindowId},
+    /// };
+    ///
+    /// struct Check(bool);
+    ///
+    /// impl ApplicationHandler for Check {
+    ///     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+    ///         let attributes = WindowAttributes::default()
+    ///             .with_decorations(false)
+    ///             .with_visible(false)
+    ///             .with_active(false)
+    ///             .with_platform_attributes(Box::new(
+    ///                 WindowAttributesMacOS::default().with_panel(true),
+    ///             ));
+    ///         let window = event_loop.create_window(attributes).unwrap();
+    ///         let RawWindowHandle::AppKit(raw) = window.window_handle().unwrap().as_raw() else {
+    ///             panic!("the macOS test creates an AppKit window")
+    ///         };
+    ///
+    ///         // SAFETY: The live main-thread window owns this borrowed view and its
+    ///         // panel throughout the synchronous native assertions.
+    ///         let view = unsafe { raw.ns_view.cast::<NSView>().as_ref() };
+    ///         let native = view.window().unwrap();
+    ///         let panel = native.downcast_ref::<NSPanel>().unwrap();
+    ///         // The inherited response is system policy, not a fixed API default.
+    ///         assert_eq!(window.needs_panel_to_become_key(), view.needsPanelToBecomeKey());
+    ///
+    ///         // Passive content must not disable the panel's explicit focus capability.
+    ///         panel.setBecomesKeyOnlyIfNeeded(true);
+    ///         window.set_needs_panel_to_become_key(false);
+    ///         assert!(!view.needsPanelToBecomeKey());
+    ///         assert!(!window.needs_panel_to_become_key());
+    ///         assert!(panel.canBecomeKeyWindow(), "passive content retains window capability");
+    ///
+    ///         window.set_needs_panel_to_become_key(true);
+    ///         assert!(view.needsPanelToBecomeKey());
+    ///         assert!(window.needs_panel_to_become_key());
+    ///         assert!(panel.canBecomeKeyWindow());
+    ///
+    ///         self.0 = true;
+    ///         event_loop.exit();
+    ///     }
+    ///
+    ///     fn window_event(&mut self, _: &dyn ActiveEventLoop, _: WindowId, _: WindowEvent) {}
+    /// }
+    ///
+    /// let mut check = Check(false);
+    /// EventLoop::new(&PlatformSpecificEventLoopAttributes::default())
+    ///     .unwrap()
+    ///     .run_app_on_demand(&mut check)
+    ///     .unwrap();
+    /// assert!(check.0, "native assertions ran on the main thread");
+    /// ```
+    fn needs_panel_to_become_key(&self) -> bool;
+
     /// Group windows together by using the same tabbing identifier.
     ///
     /// <https://developer.apple.com/documentation/appkit/nswindow/1644704-tabbingidentifier>
@@ -245,6 +345,18 @@ impl WindowExtMacOS for dyn Window + '_ {
     fn set_has_shadow(&self, has_shadow: bool) {
         let window = self.cast_ref::<AppKitWindow>().unwrap();
         window.maybe_wait_on_main(move |w| w.set_has_shadow(has_shadow));
+    }
+
+    #[inline]
+    fn set_needs_panel_to_become_key(&self, needs_key: bool) {
+        let window = self.cast_ref::<AppKitWindow>().unwrap();
+        window.maybe_wait_on_main(move |w| w.set_needs_panel_to_become_key(needs_key));
+    }
+
+    #[inline]
+    fn needs_panel_to_become_key(&self) -> bool {
+        let window = self.cast_ref::<AppKitWindow>().unwrap();
+        window.maybe_wait_on_main(|w| w.needs_panel_to_become_key())
     }
 
     #[inline]

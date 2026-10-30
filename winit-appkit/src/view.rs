@@ -183,6 +183,11 @@ pub struct ViewState {
     /// Strong reference to the global application state.
     app_state: Rc<AppState>,
 
+    /// An explicit policy for winit's view, independent of the panel's ability
+    /// to become key. None preserves AppKit's inherited behavior until a caller
+    /// supplies an override; all reads and writes stay on the UI thread.
+    needs_panel_to_become_key: Cell<Option<bool>>,
+
     /// This is for a dragging session that we initiated
     dragging_session: RefCell<Option<Retained<NSDraggingSession>>>,
 
@@ -273,6 +278,32 @@ define_class!(
         fn accepts_first_responder(&self) -> bool {
             let _entered = trace_span!("acceptsFirstResponder").entered();
             true
+        }
+
+        // AppKit consults the hit view for conditional panel activation and
+        // first-responder-on-click policy. Winit installs this private view inside
+        // a plain contentView wrapper; changing the wrapper cannot override this
+        // read-only method. On macOS 27.2, the inherited response on WinitView was
+        // true while the plain wrapper reported false, despite NSView's documented
+        // default being false. Preserve the actual inherited response rather than
+        // assuming a constant default for every system and view configuration.
+        //
+        // Changing canBecomeKeyWindow instead would also prevent native keyboard
+        // controls and explicit focus requests from making the panel key.
+        // https://developer.apple.com/documentation/appkit/nsview/needspaneltobecomekey
+        // https://developer.apple.com/documentation/appkit/nspanel/becomeskeyonlyifneeded
+        // https://developer.apple.com/documentation/appkit/nswindow/canbecomekey
+        #[unsafe(method(needsPanelToBecomeKey))]
+        fn panel_needs_key(&self) -> bool {
+            let _entered = trace_span!("needsPanelToBecomeKey").entered();
+
+            if let Some(needs_key) = self.ivars().needs_panel_to_become_key.get() {
+                needs_key
+            } else {
+                // SAFETY: This live main-thread NSView forwards the same query
+                // synchronously to its superclass without changing ownership.
+                unsafe { msg_send![super(self), needsPanelToBecomeKey] }
+            }
         }
 
         // This is necessary to prevent a beefy terminal error on MacBook Pros:
@@ -947,6 +978,7 @@ impl WinitView {
     ) -> Retained<Self> {
         let this = mtm.alloc().set_ivars(ViewState {
             app_state: Rc::clone(app_state),
+            needs_panel_to_become_key: Cell::new(None),
             dragging_session: Default::default(),
             drag_operations: Cell::new(NSDragOperation::empty()),
             resize_drag: Cell::new(None),
@@ -1243,6 +1275,10 @@ impl WinitView {
             self.ivars().modifiers.set(Modifiers::default());
             self.queue_event(WindowEvent::ModifiersChanged(self.ivars().modifiers.get()));
         }
+    }
+
+    pub(crate) fn set_needs_panel_to_become_key(&self, needs_key: bool) {
+        self.ivars().needs_panel_to_become_key.set(Some(needs_key));
     }
 
     pub(super) fn set_option_as_alt(&self, value: OptionAsAlt) {

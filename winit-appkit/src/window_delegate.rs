@@ -2430,6 +2430,16 @@ impl WindowExtMacOS for WindowDelegate {
     }
 
     #[inline]
+    fn set_needs_panel_to_become_key(&self, needs_key: bool) {
+        self.view().set_needs_panel_to_become_key(needs_key);
+    }
+
+    #[inline]
+    fn needs_panel_to_become_key(&self) -> bool {
+        self.view().needsPanelToBecomeKey()
+    }
+
+    #[inline]
     fn set_tabbing_identifier(&self, identifier: &str) {
         self.window().setTabbingIdentifier(&NSString::from_str(identifier))
     }

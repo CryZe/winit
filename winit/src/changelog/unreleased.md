@@ -42,6 +42,10 @@ changelog entry.
 
 ### Added
 
+- On macOS, add `WindowExtMacOS::set_needs_panel_to_become_key` and its getter
+  to control the view's native click-focus policy, including conditional activation
+  of nonactivating panels, while preserving explicit window focus capability.
+
 - On macOS, implement `Window::drag_resize_window` for resizable borderless
   windows outside fullscreen, preserving size constraints and resize increments.
 
