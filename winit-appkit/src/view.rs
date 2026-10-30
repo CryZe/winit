@@ -1,3 +1,7 @@
+//! Owns AppKit view input, native gestures and surface notifications.
+//! Window policy and application text storage remain with callers; view methods run
+//! on the main thread and must not retain borrows across native or application callbacks.
+
 #![allow(clippy::unnecessary_cast)]
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -58,7 +62,7 @@ impl Default for CursorState {
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Default)]
 enum ImeState {
     #[default]
-    /// The IME events are disabled, so only `ReceivedCharacter` is being sent to the user.
+    /// No IME session has been announced; ordinary text uses `KeyboardInput`.
     Disabled,
 
     /// The ground state of enabled IME input. It means that both Preedit and regular keyboard
@@ -68,8 +72,63 @@ enum ImeState {
     /// The IME is in preedit.
     Preedit,
 
-    /// The text was just committed, so the next input from the keyboard must be ignored.
+    /// Text was committed while interpreting the current key, which must be consumed.
     Committed,
+}
+
+/// Tracks the synchronous key interpretation that can produce an `insertText:` callback.
+///
+/// AppKit also inserts text independently of a key event, for example from the character
+/// palette. Such insertions have no `KeyboardInput` event to carry their text and must not
+/// depend on a preceding marked-text session.
+#[derive(Debug, Default)]
+struct TextInput {
+    state: Cell<ImeState>,
+    /// Retains a composition commit even if AppKit calls unmarkText: first.
+    pending_commit: Cell<bool>,
+    interpreting_key: Cell<bool>,
+}
+
+impl TextInput {
+    /// Return whether this insertion should be delivered as an IME commit, updating the
+    /// state before application callbacks can run. Ordinary key text is delivered by
+    /// `KeyboardInput`; a composition consumes its confirming key instead.
+    fn insert(&self, requested: bool, text: &str) -> bool {
+        if !requested || text.chars().next().is_some_and(char::is_control) {
+            return false;
+        }
+
+        let interpreting_key = self.interpreting_key.get();
+        if interpreting_key
+            && (!self.pending_commit.get() || self.state.get() == ImeState::Disabled)
+        {
+            return false;
+        }
+
+        self.pending_commit.set(false);
+        self.state.set(if interpreting_key { ImeState::Committed } else { ImeState::Ground });
+        true
+    }
+
+    fn interpret_key(&self, interpret: impl FnOnce()) {
+        // AppKit calls the text-input methods synchronously from interpretKeyEvents:.
+        // Restore the enclosing scope if a native callback reenters key handling, and do
+        // not hold a RefCell borrow across AppKit or application callbacks.
+        struct Restore<'a> {
+            cell: &'a Cell<bool>,
+            previous: bool,
+        }
+
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.cell.set(self.previous);
+            }
+        }
+
+        let _restore =
+            Restore { cell: &self.interpreting_key, previous: self.interpreting_key.replace(true) };
+        interpret();
+    }
 }
 
 bitflags::bitflags! {
@@ -139,11 +198,8 @@ pub struct ViewState {
     ime_size: Cell<NSSize>,
     modifiers: Cell<Modifiers>,
     phys_modifiers: RefCell<HashMap<Key, ModLocationMask>>,
-    ime_state: Cell<ImeState>,
+    text_input: TextInput,
     input_source: RefCell<String>,
-
-    /// True if this view was in a preedit session that will result in a commit.
-    pending_commit: Cell<bool>,
 
     /// True iff the application wants IME events.
     ///
@@ -298,18 +354,18 @@ define_class!(
             *self.ivars().marked_text.borrow_mut() = marked_text;
 
             // Notify IME is active if application still doesn't know it.
-            if self.ivars().ime_state.get() == ImeState::Disabled {
+            if self.ivars().text_input.state.get() == ImeState::Disabled {
                 *self.ivars().input_source.borrow_mut() = self.current_input_source();
                 self.queue_event(WindowEvent::Ime(Ime::Enabled));
             }
 
             if self.hasMarkedText() {
-                self.ivars().ime_state.set(ImeState::Preedit);
+                self.ivars().text_input.state.set(ImeState::Preedit);
             } else {
                 // In case the preedit was cleared, set IME into the Ground state.
-                self.ivars().ime_state.set(ImeState::Ground);
+                self.ivars().text_input.state.set(ImeState::Ground);
             }
-            self.ivars().pending_commit.set(true);
+            self.ivars().text_input.pending_commit.set(true);
 
             let string = string.to_string();
             let cursor_range = if string.is_empty() {
@@ -344,7 +400,7 @@ define_class!(
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             if self.is_ime_enabled() {
                 // Leave the Preedit self.ivars()
-                self.ivars().ime_state.set(ImeState::Ground);
+                self.ivars().text_input.state.set(ImeState::Ground);
             } else {
                 tracing::warn!("Expected to have IME enabled when receiving unmarkText");
             }
@@ -408,24 +464,41 @@ define_class!(
                 panic!("unexpected text {string:?}")
             };
 
-            let is_control = string.chars().next().is_some_and(|c| c.is_control());
             let has_marked = self.hasMarkedText();
-            let pending_commit = self.ivars().pending_commit.get();
+            let pending_commit = self.ivars().text_input.pending_commit.get();
             let ime_enabled = self.is_ime_enabled();
+            let ime_requested = self.ivars().ime_capabilities.get().is_some();
 
-            // Clear preedit if there is marked text.
-            if has_marked {
-                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+            trace!(
+                has_marked,
+                pending_commit,
+                ime_enabled,
+                ime_requested,
+                interpreting_key = self.ivars().text_input.interpreting_key.get(),
+                "Native text insertion"
+            );
+
+            if !self.ivars().text_input.insert(ime_requested, &string) {
+                return;
             }
 
-            // Only commit via IME if there was a real composition session.
-            // Some IMEs send insertText for all typing (e.g. spaces, English chars)
-            // which should go through keyboard input instead of paste.
-            if pending_commit && ime_enabled && !is_control {
-                self.ivars().pending_commit.set(false);
-                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
-                self.ivars().ime_state.set(ImeState::Committed);
+            // Key interpretation clears marked text in keyDown:'s epilogue, after AppKit
+            // has finished its callbacks. A standalone insertion has no such epilogue.
+            if !self.ivars().text_input.interpreting_key.get() {
+                *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
             }
+
+            // The character palette can insert without ever starting marked text. Announce
+            // the session before committing, just as setMarkedText: does for composition.
+            if !ime_enabled {
+                *self.ivars().input_source.borrow_mut() = self.current_input_source();
+                self.queue_event(WindowEvent::Ime(Ime::Enabled));
+            }
+
+            // Every commit clears the application's preedit, including when no marked
+            // text preceded it, as required by the Ime::Commit event contract.
+            self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+            self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
         }
 
         // Basically, we're sent this message whenever a keyboard event that doesn't generate a
@@ -438,15 +511,15 @@ define_class!(
             // sending it twice with some IMEs like Korean one. We'll also always send
             // `Enter` in that case, which is not desired given it was used to confirm
             // IME input.
-            if self.ivars().ime_state.get() == ImeState::Committed {
+            if self.ivars().text_input.state.get() == ImeState::Committed {
                 return;
             }
 
             self.ivars().forward_key_to_app.set(true);
 
-            if self.hasMarkedText() && self.ivars().ime_state.get() == ImeState::Preedit {
+            if self.hasMarkedText() && self.ivars().text_input.state.get() == ImeState::Preedit {
                 // Leave preedit so that we also report the key-up for this key.
-                self.ivars().ime_state.set(ImeState::Ground);
+                self.ivars().text_input.state.set(ImeState::Ground);
             }
 
             // Send command action to user if they requested it.
@@ -478,13 +551,13 @@ define_class!(
                 if *prev_input_source != current_input_source && self.is_ime_enabled() {
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
-                    self.ivars().ime_state.set(ImeState::Disabled);
+                    self.ivars().text_input.state.set(ImeState::Disabled);
                     self.queue_event(WindowEvent::Ime(Ime::Disabled));
                 }
             }
 
             // Get the characters from the event.
-            let old_ime_state = self.ivars().ime_state.get();
+            let old_ime_state = self.ivars().text_input.state.get();
             self.ivars().forward_key_to_app.set(false);
             let event = replace_event(event, self.option_as_alt());
 
@@ -496,26 +569,27 @@ define_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_capabilities.get().is_some() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
-                self.interpretKeyEvents(&events_for_nsview);
+                self.ivars().text_input.interpret_key(|| {
+                    self.interpretKeyEvents(&events_for_nsview);
+                });
 
-                // If the text was committed we must treat the next keyboard event as IME related.
-                if self.ivars().ime_state.get() == ImeState::Committed {
-                    // Remove any marked text, so normal input can continue.
+                // Wait for all callbacks from AppKit before clearing the marked text.
+                if self.ivars().text_input.state.get() == ImeState::Committed {
                     *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
                 }
             }
 
             self.update_modifiers(&event, false);
 
-            let had_ime_input = match self.ivars().ime_state.get() {
+            let had_ime_input = match self.ivars().text_input.state.get() {
                 ImeState::Committed => {
                     // Allow normal input after the commit.
-                    self.ivars().ime_state.set(ImeState::Ground);
+                    self.ivars().text_input.state.set(ImeState::Ground);
                     true
                 },
                 ImeState::Preedit => true,
                 // `key_down` could result in preedit clear, so compare old and current state.
-                _ => old_ime_state != self.ivars().ime_state.get(),
+                _ => old_ime_state != self.ivars().text_input.state.get(),
             };
 
             if !had_ime_input || self.ivars().forward_key_to_app.get() {
@@ -536,7 +610,8 @@ define_class!(
             self.update_modifiers(&event, false);
 
             // We want to send keyboard input when we are currently in the ground state.
-            if matches!(self.ivars().ime_state.get(), ImeState::Ground | ImeState::Disabled) {
+            if matches!(self.ivars().text_input.state.get(), ImeState::Ground | ImeState::Disabled)
+            {
                 self.queue_event(WindowEvent::KeyboardInput {
                     device_id: None,
                     event: create_key_event(&event, false, false),
@@ -880,9 +955,8 @@ impl WinitView {
             ime_size: Default::default(),
             modifiers: Default::default(),
             phys_modifiers: Default::default(),
-            ime_state: Default::default(),
+            text_input: Default::default(),
             input_source: Default::default(),
-            pending_commit: Default::default(),
             ime_capabilities: Default::default(),
             forward_key_to_app: Default::default(),
             marked_text: Default::default(),
@@ -1089,7 +1163,7 @@ impl WinitView {
     }
 
     fn is_ime_enabled(&self) -> bool {
-        !matches!(self.ivars().ime_state.get(), ImeState::Disabled)
+        !matches!(self.ivars().text_input.state.get(), ImeState::Disabled)
     }
 
     fn current_input_source(&self) -> String {
@@ -1126,30 +1200,30 @@ impl WinitView {
         // (it was also broken but let's not break things worse)
 
         // if self.ivars().ime_capabilities.get().is_none() {
-        //     self.ivars().ime_state.set(ImeState::Ground);
+        //     self.ivars().text_input.state.set(ImeState::Ground);
         // }
 
         // why are we disabling things in an enable fn? who knows. it's what the previous one did
         // though
-        if self.ivars().ime_state.get() != ImeState::Disabled {
-            self.ivars().ime_state.set(ImeState::Disabled);
+        if self.ivars().text_input.state.get() != ImeState::Disabled {
+            self.ivars().text_input.state.set(ImeState::Disabled);
             self.queue_event(WindowEvent::Ime(Ime::Disabled));
         }
         self.ivars().ime_capabilities.set(Some(capabilities));
         *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
-        self.ivars().pending_commit.set(false);
+        self.ivars().text_input.pending_commit.set(false);
     }
     pub(super) fn disable_ime(&self) {
         // see above
         self.ivars().ime_capabilities.set(None);
-        if self.ivars().ime_state.get() != ImeState::Disabled {
-            self.ivars().ime_state.set(ImeState::Disabled);
+        if self.ivars().text_input.state.get() != ImeState::Disabled {
+            self.ivars().text_input.state.set(ImeState::Disabled);
             self.queue_event(WindowEvent::Ime(Ime::Disabled));
         }
         // we probably don't need to do this, but again this mirrors the prior behavior of
         // `set_ime_allowed`
         *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
-        self.ivars().pending_commit.set(false);
+        self.ivars().text_input.pending_commit.set(false);
     }
 
     pub(super) fn ime_capabilities(&self) -> Option<ImeCapabilities> {
@@ -1470,6 +1544,94 @@ fn utf16_to_utf8_offset(s: &str, utf16_offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn character_palette_commits_without_preedit_and_leaves_next_key_alone() {
+        let input = TextInput::default();
+
+        assert!(input.insert(true, "😀"));
+        assert_eq!(input.state.get(), ImeState::Ground);
+        assert!(!input.pending_commit.get());
+
+        input.interpret_key(|| assert!(!input.insert(true, "a")));
+        assert_eq!(input.state.get(), ImeState::Ground);
+        assert!(input.insert(true, "😀"));
+    }
+
+    #[test]
+    fn ordinary_key_text_uses_keyboard_input_before_and_after_ime_activation() {
+        let input = TextInput::default();
+
+        for state in [ImeState::Disabled, ImeState::Ground] {
+            input.state.set(state);
+            input.interpret_key(|| {
+                assert!(!input.insert(true, "a"));
+                assert!(!input.insert(true, " "));
+            });
+            assert_eq!(input.state.get(), state);
+        }
+    }
+
+    #[test]
+    fn composition_commit_consumes_only_its_confirming_key() {
+        let input = TextInput::default();
+
+        // An IME may unmark before inserting. Both Preedit and Ground must retain
+        // the pending composition, independently of whether marked text remains.
+        for state in [ImeState::Preedit, ImeState::Ground] {
+            input.state.set(state);
+            input.pending_commit.set(true);
+            input.interpret_key(|| {
+                assert!(input.insert(true, "😀"));
+                assert_eq!(input.state.get(), ImeState::Committed);
+                assert!(!input.pending_commit.get());
+            });
+
+            input.state.set(ImeState::Ground);
+            input.interpret_key(|| assert!(!input.insert(true, "a")));
+        }
+    }
+
+    #[test]
+    fn asynchronous_composition_commit_does_not_consume_an_unrelated_key() {
+        let input = TextInput::default();
+        input.state.set(ImeState::Preedit);
+        input.pending_commit.set(true);
+
+        assert!(input.insert(true, "😀"));
+        assert_eq!(input.state.get(), ImeState::Ground);
+        assert!(!input.pending_commit.get());
+        input.interpret_key(|| assert!(!input.insert(true, "a")));
+    }
+
+    #[test]
+    fn disabled_input_and_control_commands_do_not_commit() {
+        let input = TextInput::default();
+
+        assert!(!input.insert(false, "😀"));
+        assert!(!input.insert(true, "\r"));
+        assert_eq!(input.state.get(), ImeState::Disabled);
+
+        input.state.set(ImeState::Preedit);
+        input.pending_commit.set(true);
+        input.interpret_key(|| {
+            assert!(!input.insert(false, "😀"));
+            assert!(!input.insert(true, "\r"));
+        });
+        assert!(input.pending_commit.get());
+        assert_eq!(input.state.get(), ImeState::Preedit);
+    }
+
+    #[test]
+    fn nested_key_interpretation_restores_the_enclosing_context() {
+        let input = TextInput::default();
+
+        input.interpret_key(|| {
+            input.interpret_key(|| assert!(!input.insert(true, "a")));
+            assert!(!input.insert(true, "😀"));
+        });
+        assert!(input.insert(true, "😀"));
+    }
 
     /// Apply the UTF-16 -> UTF-8 conversion to both ends of a `selectedRange {loc, len}`,
     /// mirroring what `set_marked_text` does for the emitted `Ime::Preedit` cursor range.
