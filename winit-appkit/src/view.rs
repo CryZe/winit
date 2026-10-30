@@ -9,30 +9,39 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, Message, define_class, msg_send};
 use objc2_app_kit::{
     NSApplication, NSCursor, NSDragOperation, NSDraggingSession, NSEvent, NSEventPhase,
-    NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView,
-    NSViewLayerContentsRedrawPolicy, NSWindow,
+    NSEventType, NSResponder, NSTextInputClient, NSTrackingArea, NSTrackingAreaOptions, NSView,
+    NSViewLayerContentsRedrawPolicy, NSWindow, NSWindowStyleMask,
 };
 use objc2_core_foundation::CGRect;
 use objc2_foundation::{
     NSArray, NSAttributedString, NSAttributedStringKey, NSCopying, NSMutableAttributedString,
     NSNotFound, NSObject, NSPoint, NSRange, NSRect, NSSize, NSString, NSUInteger,
 };
-use tracing::{debug_span, trace_span};
-use winit_core::event::{
-    DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta,
-    PointerKind, PointerSource, TouchPhase, WindowEvent,
+use tracing::{debug_span, trace, trace_span};
+use winit_core::{
+    error::NotSupportedError,
+    event::{
+        DeviceEvent, ElementState, Ime, KeyEvent, Modifiers, MouseButton, MouseScrollDelta,
+        PointerKind, PointerSource, TouchPhase, WindowEvent,
+    },
+    keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey},
+    window::{ImeCapabilities, ResizeDirection},
 };
-use winit_core::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey};
-use winit_core::window::ImeCapabilities;
 
-use super::app_state::AppState;
-use super::cursor::{default_cursor, invisible_cursor};
-use super::event::{
-    code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
-    scancode_to_physicalkey,
+use crate::{
+    OptionAsAlt,
+    app_state::AppState,
+    cursor::{default_cursor, invisible_cursor},
+    event::{
+        code_to_key, code_to_location, create_key_event, event_mods, lalt_pressed, ralt_pressed,
+        scancode_to_physicalkey,
+    },
+    resize::ResizeDrag,
+    window::window_id,
 };
-use super::window::window_id;
-use crate::OptionAsAlt;
+
+// NSEvent::pressedMouseButtons assigns bit zero to the primary button.
+const PRIMARY_BUTTON_MASK: usize = 1;
 
 #[derive(Debug)]
 struct CursorState {
@@ -120,6 +129,10 @@ pub struct ViewState {
 
     /// This is for a dragging session that we initiated
     drag_operations: Cell<NSDragOperation>,
+
+    /// Borderless resize tracking is confined to this view. Copying the geometry
+    /// out of the cell keeps native frame callbacks free to reenter the view.
+    resize_drag: Cell<Option<ResizeDrag>>,
 
     cursor_state: RefCell<CursorState>,
     ime_position: Cell<NSPoint>,
@@ -596,6 +609,7 @@ define_class!(
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let _entered = debug_span!("mouseDown:").entered();
+            self.cancel_resize();
             if self.handle_event(event) {
                 return;
             }
@@ -606,6 +620,7 @@ define_class!(
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
             let _entered = debug_span!("mouseUp:").entered();
+            self.cancel_resize();
             if self.handle_event(event) {
                 return;
             }
@@ -665,6 +680,9 @@ define_class!(
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
             let _entered = debug_span!("mouseDragged:").entered();
+            if self.resize_drag(event) {
+                return;
+            }
             if self.handle_event(event) {
                 return;
             }
@@ -856,6 +874,7 @@ impl WinitView {
             app_state: Rc::clone(app_state),
             dragging_session: Default::default(),
             drag_operations: Cell::new(NSDragOperation::empty()),
+            resize_drag: Cell::new(None),
             cursor_state: Default::default(),
             ime_position: Default::default(),
             ime_size: Default::default(),
@@ -962,9 +981,107 @@ impl WinitView {
         let Some(window) = (**self).window() else {
             return;
         };
-        if window.inLiveResize() {
+        let resizing = self.ivars().resize_drag.get().is_some();
+        if window.inLiveResize() || resizing {
             self.ivars().app_state.handle_redraw(window_id(&window));
         }
+    }
+
+    /// Begin only from the owning view's native primary-button event. AppKit
+    /// continues delivering its drag/release to that view outside the window,
+    /// so no global monitor, polling or pointer warp is needed.
+    pub(crate) fn begin_resize(
+        &self,
+        direction: ResizeDirection,
+        increments: NSSize,
+    ) -> Result<(), NotSupportedError> {
+        let Some(window) = (**self).window() else {
+            return Err(NotSupportedError::new("resize requires an attached view"));
+        };
+        let event = self.window_drag_press(&window)?;
+        self.ivars().resize_drag.set(Some(ResizeDrag::new(
+            direction,
+            window.frame(),
+            window.convertPointToScreen(event.locationInWindow()),
+            increments,
+        )));
+        Ok(())
+    }
+
+    pub(crate) fn cancel_resize(&self) {
+        self.ivars().resize_drag.set(None);
+    }
+
+    fn window_drag_press(&self, window: &NSWindow) -> Result<Retained<NSEvent>, NotSupportedError> {
+        let application = NSApplication::sharedApplication(MainThreadMarker::from(self));
+        let Some(event) = application.currentEvent() else {
+            return Err(NotSupportedError::new("window drag requires a left mouse press"));
+        };
+        if event.r#type() != NSEventType::LeftMouseDown
+            || event.windowNumber() != window.windowNumber()
+        {
+            return Err(NotSupportedError::new(
+                "window drag requires this window's left mouse press",
+            ));
+        }
+        Ok(event)
+    }
+
+    pub(crate) fn begin_window_move(&self) -> Result<(), NotSupportedError> {
+        let Some(window) = (**self).window() else {
+            return Err(NotSupportedError::new("window move requires an attached view"));
+        };
+        let press = self.window_drag_press(&window)?;
+        // Match AppKit's background dragging: multi-click presses do not start
+        // window moves. Passing one to the explicit drag API instead emits
+        // "Window move completed without beginning" on macOS 27.2, even in a
+        // plain NSView without winit. Keep the original single-click press;
+        // synthesizing a different click count would change native semantics.
+        // https://developer.apple.com/documentation/appkit/nswindow/performdrag(with:)
+        if press.clickCount() != 1 {
+            return Ok(());
+        }
+
+        // A queued press can arrive after physical release. The native API
+        // cannot start that gesture either, so check the live primary-button
+        // state immediately before handing the original press to AppKit.
+        let primary_down = NSEvent::pressedMouseButtons() & PRIMARY_BUTTON_MASK != 0;
+        trace!(primary_down, "native window move request");
+        if primary_down {
+            window.performWindowDragWithEvent(&press);
+        }
+        Ok(())
+    }
+
+    fn resize_drag(&self, event: &NSEvent) -> bool {
+        let resize = self.ivars().resize_drag.get();
+        let Some(drag) = resize else {
+            return false;
+        };
+        let Some(window) = (**self).window() else {
+            self.cancel_resize();
+            return false;
+        };
+        let style = window.styleMask();
+        if !window.isVisible()
+            || !style.contains(NSWindowStyleMask::Resizable)
+            || style.intersects(NSWindowStyleMask::Titled | NSWindowStyleMask::FullScreen)
+        {
+            self.cancel_resize();
+            return false;
+        }
+
+        let frame = drag.frame_at(
+            window.convertPointToScreen(event.locationInWindow()),
+            window.minSize(),
+            window.maxSize(),
+        );
+        if frame != window.frame() {
+            // Native frame updates publish the normal surface-size/move
+            // callbacks. The resize state is copied before this reentrant call.
+            window.setFrame_display(frame, true);
+        }
+        true
     }
 
     pub(crate) fn scale_factor(&self) -> f64 {

@@ -1570,7 +1570,9 @@ pub trait Window: Any + Send + Sync + fmt::Debug {
     ///
     /// - **X11:** Un-grabs the cursor.
     /// - **Wayland:** Requires a pointer button or touch point to be down inside the window.
-    /// - **macOS:** May prevent the button release event to be triggered.
+    /// - **macOS:** Call from this window's left-button press handler while the button is held.
+    ///   Multi-click presses do not start a move, matching native background dragging.
+    ///   The button release event may not be delivered after a native move starts.
     /// - **iOS / Android / Web:** Always returns an [`RequestError::NotSupported`].
     fn drag_window(&self) -> Result<(), RequestError>;
 
@@ -1582,7 +1584,9 @@ pub trait Window: Any + Send + Sync + fmt::Debug {
     /// ## Platform-specific
     ///
     /// - **Wayland:** Requires a pointer button or touch point to be down inside the window.
-    /// - **macOS:** Always returns an [`RequestError::NotSupported`]
+    /// - **macOS:** Supported for resizable, undecorated windows outside fullscreen.
+    ///   Call from this window's left-button press handler. Other windows return
+    ///   [`RequestError::NotSupported`]; their native frame owns edge resizing.
     /// - **iOS / Android / Web:** Always returns an [`RequestError::NotSupported`].
     fn drag_resize_window(&self, direction: ResizeDirection) -> Result<(), RequestError>;
 

@@ -79,6 +79,7 @@ mod ffi;
 mod menu;
 mod monitor;
 mod observer;
+mod resize;
 mod view;
 mod window;
 mod window_delegate;
