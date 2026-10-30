@@ -51,6 +51,10 @@ changelog entry.
 
 ### Fixed
 
+- On Windows, reapply the requested IME cursor area when native composition starts.
+  This restores placement for input methods that discard it, as observed with
+  Microsoft Japanese IME after a layout switch.
+
 - On macOS, validate `Window::drag_window` against the originating mouse press
   and live button state before starting a native move. Multi-click presses do
   not start a move, matching AppKit background dragging without its warning.

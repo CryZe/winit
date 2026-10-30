@@ -1094,42 +1094,67 @@ impl CoreWindow for Window {
 
         let window = self.window;
         let state = self.window_state.clone();
-        self.thread_executor.execute_in_thread(move || unsafe {
+        self.thread_executor.execute_in_thread(move || {
             let hwnd = window.hwnd();
-            let mut state = state.lock().unwrap();
-            let (capabilities, request_data) = match &request {
+            let mut guard = state.lock().unwrap();
+            let request_data = match &request {
                 ImeRequest::Enable(enable) => {
-                    let capabilities = *enable.capabilities();
-                    state.ime_capabilities = Some(capabilities);
-                    ImeContext::set_ime_allowed(hwnd, true);
-                    (capabilities, enable.request_data())
+                    guard.set_ime_capabilities(Some(*enable.capabilities()));
+                    enable.request_data()
                 },
                 ImeRequest::Update(request_data) => {
-                    if let Some(capabilities) = state.ime_capabilities {
-                        (capabilities, request_data)
+                    if guard.ime_capabilities.is_some() {
+                        request_data
                     } else {
                         warn!("ime update without IME enabled.");
                         return;
                     }
                 },
                 ImeRequest::Disable => {
-                    state.ime_capabilities = None;
-                    ImeContext::set_ime_allowed(window.hwnd(), false);
+                    guard.set_ime_capabilities(None);
+                    drop(guard);
+                    // SAFETY: The executor runs on this live window's owning
+                    // thread. Do not hold state across native IMM callbacks.
+                    unsafe { ImeContext::set_ime_allowed(hwnd, false) };
                     return;
                 },
                 _ => return,
             };
 
-            if let Some((spot, size)) = request_data.cursor_area {
-                if capabilities.cursor_area() {
-                    let scale_factor = state.scale_factor;
-                    ImeContext::current(window.hwnd()).set_ime_cursor_area(
-                        spot,
-                        size,
-                        scale_factor,
-                    );
+            let update_cursor = if let Some((spot, size)) = request_data.cursor_area {
+                if guard.set_ime_cursor_area(spot, size) {
+                    true
                 } else {
                     warn!("discarding IME cursor area update without capability enabled.");
+                    false
+                }
+            } else {
+                false
+            };
+            drop(guard);
+
+            if matches!(request, ImeRequest::Enable(_)) {
+                // SAFETY: The executor owns this window's UI thread. Requested
+                // state is recorded before associating a context, since IMM may
+                // synchronously reenter the window procedure during activation.
+                unsafe { ImeContext::set_ime_allowed(hwnd, true) };
+            }
+
+            if update_cursor {
+                // A context-activation callback may update the request again.
+                // Read its latest rectangle and scale, then release the lock
+                // before IMM can deliver another native notification.
+                let area = {
+                    let guard = state.lock().unwrap();
+                    guard.ime_cursor_area.map(|area| (area, guard.scale_factor))
+                };
+
+                if let Some(((spot, size), scale_factor)) = area {
+                    // SAFETY: The live UI-thread HWND owns this temporary IMM
+                    // context, which is released before leaving the block.
+                    unsafe {
+                        ImeContext::current(hwnd).set_ime_cursor_area(spot, size, scale_factor);
+                    }
                 }
             }
         });

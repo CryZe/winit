@@ -1620,8 +1620,27 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_IME_STARTCOMPOSITION => {
-            let ime_allowed = userdata.window_state_lock().ime_capabilities.is_some();
+            let (ime_allowed, cursor_area, scale_factor) = {
+                let state = userdata.window_state_lock();
+                (state.ime_capabilities.is_some(), state.ime_cursor_area, state.scale_factor)
+            };
+
             if ime_allowed {
+                // Microsoft Japanese IME was observed to reset candidate placement
+                // to CFS_DEFAULT after an input-layout switch. The client already
+                // supplied its cursor rectangle; a new native composition does not
+                // invalidate that requested state. Restore it before Enabled or
+                // the first Preedit can open a candidate window at the screen edge.
+                // Keep the state lock out of IMM calls and application callbacks.
+                // https://learn.microsoft.com/en-us/windows/win32/intl/wm-ime-startcomposition
+                if let Some((spot, size)) = cursor_area {
+                    // SAFETY: This callback owns the live HWND on its UI thread;
+                    // the temporary acquired IMM context is released immediately.
+                    unsafe {
+                        ImeContext::current(window).set_ime_cursor_area(spot, size, scale_factor);
+                    }
+                }
+
                 userdata.window_state_lock().ime_state = ImeState::Enabled;
 
                 if let Err(error) = userdata.key_event_builder.begin_composition() {

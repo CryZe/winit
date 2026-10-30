@@ -2,7 +2,7 @@ use std::sync::MutexGuard;
 use std::{fmt, io, ptr};
 
 use bitflags::bitflags;
-use dpi::{PhysicalPosition, PhysicalSize, Size};
+use dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::InvalidateRgn;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -68,6 +68,10 @@ pub(crate) struct WindowState {
 
     pub ime_state: ImeState,
     pub ime_capabilities: Option<ImeCapabilities>,
+    // The requested rectangle belongs to the window's IME session, not to the
+    // native input method that last received it. Keep its original units so a
+    // new native activation uses the window's current scale factor.
+    pub ime_cursor_area: Option<(Position, Size)>,
 
     // Used by WM_NCACTIVATE, WM_SETFOCUS and WM_KILLFOCUS
     pub is_active: bool,
@@ -219,6 +223,7 @@ impl WindowState {
 
             ime_state: ImeState::Disabled,
             ime_capabilities: None,
+            ime_cursor_area: None,
 
             is_active: false,
             is_focused: false,
@@ -230,6 +235,22 @@ impl WindowState {
 
             use_system_wheel_speed: true,
         }
+    }
+
+    pub(crate) fn set_ime_capabilities(&mut self, capabilities: Option<ImeCapabilities>) {
+        self.ime_capabilities = capabilities;
+        // An explicit disable/re-enable starts a new requested session. Cursor
+        // data from the previous one must not survive a capability change.
+        self.ime_cursor_area = None;
+    }
+
+    pub(crate) fn set_ime_cursor_area(&mut self, position: Position, size: Size) -> bool {
+        if !self.ime_capabilities.is_some_and(|capabilities| capabilities.cursor_area()) {
+            return false;
+        }
+
+        self.ime_cursor_area = Some((position, size));
+        true
     }
 
     pub fn window_flags(&self) -> WindowFlags {
@@ -615,7 +636,50 @@ impl CursorFlags {
 
 #[cfg(test)]
 mod tests {
+    use dpi::{LogicalPosition, LogicalSize};
+
     use super::*;
+
+    fn ime_state() -> WindowState {
+        WindowState::new(
+            &WindowAttributes::default(),
+            &WindowAttributesWindows::default(),
+            1.0,
+            Theme::Dark,
+            None,
+        )
+    }
+
+    #[test]
+    fn ime_geometry_requires_the_requested_cursor_capability() {
+        let mut state = ime_state();
+        let position = LogicalPosition::new(120.0, 80.0).into();
+        let size = LogicalSize::new(2.0, 24.0).into();
+
+        assert!(!state.set_ime_cursor_area(position, size));
+        state.set_ime_capabilities(Some(ImeCapabilities::new()));
+        assert!(!state.set_ime_cursor_area(position, size));
+        assert!(state.ime_cursor_area.is_none());
+
+        state.set_ime_capabilities(Some(ImeCapabilities::new().with_cursor_area()));
+        assert!(state.set_ime_cursor_area(position, size));
+        assert_eq!(state.ime_cursor_area, Some((position, size)));
+    }
+
+    #[test]
+    fn a_new_requested_ime_session_does_not_reuse_previous_geometry() {
+        let mut state = ime_state();
+        state.set_ime_capabilities(Some(ImeCapabilities::new().with_cursor_area()));
+        assert!(state.set_ime_cursor_area(
+            LogicalPosition::new(120.0, 80.0).into(),
+            LogicalSize::new(2.0, 24.0).into(),
+        ));
+
+        state.set_ime_capabilities(None);
+        assert!(state.ime_cursor_area.is_none());
+        state.set_ime_capabilities(Some(ImeCapabilities::new()));
+        assert!(state.ime_cursor_area.is_none());
+    }
 
     #[test]
     fn owned_windows_keep_caption_and_buttons() {
