@@ -1,10 +1,15 @@
-use std::char;
+//! Assembles native Windows key messages into ordered application key events.
+//! Composition ownership is retained with each partial event, even when native
+//! message inspection reenters the window callback. Text composition itself is
+//! delivered separately by the event loop; it is not reconstructed here.
+
 use std::ffi::OsString;
 use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStringExt;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, MutexGuard};
+use std::{char, io};
 
 use smol_str::SmolStr;
 use tracing::{trace, warn};
@@ -30,6 +35,7 @@ use winit_core::keyboard::{
 };
 
 use crate::event_loop::ProcResult;
+use crate::ime::{ImeKeyState, PressedKeys};
 use crate::keyboard_layout::{LAYOUT_CACHE, Layout, LayoutCache, WindowsModifiers};
 use crate::util::{loword, primarylangid};
 
@@ -38,6 +44,7 @@ pub type ExScancode = u16;
 pub struct MessageAsKeyEvent {
     pub event: KeyEvent,
     pub is_synthetic: bool,
+    is_ime: bool,
 }
 
 /// Stores information required to make `KeyEvent`s.
@@ -62,17 +69,30 @@ pub struct MessageAsKeyEvent {
 /// text input. The "sequence" only consists of one WM_KEYUP / WM_SYSKEYUP event.
 pub struct KeyEventBuilder {
     event_info: Mutex<Option<PartialKeyEventInfo>>,
+    // The existing assembler is reentrant, so this lock protects only bounded
+    // bitset updates. It is never held with the layout/event locks or OS calls.
+    // Keyboard messages add no heap allocation; native snapshots are taken only
+    // twice per composition, not on frames or ordinary pointer/window events.
+    ime_keys: Mutex<ImeKeyState>,
     pending: PendingEventQueue<MessageAsKeyEvent>,
 }
 impl Default for KeyEventBuilder {
     fn default() -> Self {
-        KeyEventBuilder { event_info: Mutex::new(None), pending: Default::default() }
+        KeyEventBuilder {
+            event_info: Mutex::new(None),
+            ime_keys: Default::default(),
+            pending: Default::default(),
+        }
     }
 }
 impl KeyEventBuilder {
-    /// Call this function for every window message.
-    /// Returns Some() if this window message completes a KeyEvent.
-    /// Returns None otherwise.
+    /// Assemble keyboard events from each native window message.
+    ///
+    /// Real presses observed during preedit, including modifiers, and PROCESSKEY
+    /// presses stay with composition until release or a normal editing repeat
+    /// after preedit hands input back. Canceling Escape remains withheld through
+    /// release. Modifier state is still available through ModifiersChanged, and
+    /// native focus synchronization keeps its existing synthetic-event policy.
     pub(crate) fn process_message(
         &self,
         hwnd: HWND,
@@ -80,6 +100,7 @@ impl KeyEventBuilder {
         wparam: WPARAM,
         lparam: LPARAM,
         result: &mut ProcResult,
+        is_composing: bool,
     ) -> Vec<MessageAsKeyEvent> {
         enum MatchResult {
             Nothing,
@@ -90,12 +111,22 @@ impl KeyEventBuilder {
         let mut matcher = || -> MatchResult {
             match msg_kind {
                 WM_SETFOCUS => {
+                    self.ime_keys
+                        .lock()
+                        .expect("an earlier panic left composition key ownership inconsistent")
+                        .clear();
+
                     // synthesize keydown events
                     let kbd_state = get_async_kbd_state();
                     let key_events = Self::synthesize_kbd_state(ElementState::Pressed, &kbd_state);
                     MatchResult::MessagesToDispatch(self.pending.complete_multi(key_events))
                 },
                 WM_KILLFOCUS => {
+                    self.ime_keys
+                        .lock()
+                        .expect("an earlier panic left composition key ownership inconsistent")
+                        .clear();
+
                     // synthesize keyup events
                     let kbd_state = get_kbd_state();
                     let key_events = Self::synthesize_kbd_state(ElementState::Released, &kbd_state);
@@ -110,6 +141,10 @@ impl KeyEventBuilder {
                     let pending_token = self.pending.add_pending();
                     *result = ProcResult::Value(0);
 
+                    // PeekMessage can synchronously finish composition before this key's
+                    // WM_CHAR arrives. Capture IME ownership before that reentrant call,
+                    // and carry it with the partial key rather than querying it at delivery.
+                    let is_ime = self.ime_key(wparam, lparam, ElementState::Pressed, is_composing);
                     let next_msg = next_kbd_msg(hwnd);
 
                     let mut layouts = LAYOUT_CACHE.lock().unwrap();
@@ -118,6 +153,7 @@ impl KeyEventBuilder {
                         lparam,
                         ElementState::Pressed,
                         &mut layouts,
+                        is_ime,
                     ));
                     let mut event_info = self.event_info.lock().unwrap();
                     *event_info = None;
@@ -143,11 +179,10 @@ impl KeyEventBuilder {
                         }
                     }
                     if let Some(event_info) = finished_event_info {
-                        let ev = event_info.finalize();
-                        return MatchResult::MessagesToDispatch(self.pending.complete_pending(
-                            pending_token,
-                            MessageAsKeyEvent { event: ev, is_synthetic: false },
-                        ));
+                        let ev = event_info.finalize_native();
+                        return MatchResult::MessagesToDispatch(
+                            self.pending.complete_pending(pending_token, ev),
+                        );
                     }
                     MatchResult::TokenToRemove(pending_token)
                 },
@@ -157,11 +192,10 @@ impl KeyEventBuilder {
                     // At this point, we know that there isn't going to be any more events related
                     // to this key press
                     let event_info = self.event_info.lock().unwrap().take().unwrap();
-                    let ev = event_info.finalize();
-                    MatchResult::MessagesToDispatch(self.pending.complete_pending(
-                        pending_token,
-                        MessageAsKeyEvent { event: ev, is_synthetic: false },
-                    ))
+                    let ev = event_info.finalize_native();
+                    MatchResult::MessagesToDispatch(
+                        self.pending.complete_pending(pending_token, ev),
+                    )
                 },
                 WM_CHAR | WM_SYSCHAR => {
                     let mut event_info = self.event_info.lock().unwrap();
@@ -249,23 +283,24 @@ impl KeyEventBuilder {
                             let key = layout.get_key(mod_no_ctrl, num_lock_on, vkey, physical_key);
                             event_info.text = PartialText::Text(key.to_text().map(SmolStr::new));
                         }
-                        let ev = event_info.finalize();
-                        MatchResult::MessagesToDispatch(self.pending.complete_pending(
-                            pending_token,
-                            MessageAsKeyEvent { event: ev, is_synthetic: false },
-                        ))
+                        let ev = event_info.finalize_native();
+                        MatchResult::MessagesToDispatch(
+                            self.pending.complete_pending(pending_token, ev),
+                        )
                     }
                 },
                 WM_KEYUP | WM_SYSKEYUP => {
                     let pending_token = self.pending.add_pending();
                     *result = ProcResult::Value(0);
 
+                    let is_ime = self.ime_key(wparam, lparam, ElementState::Released, is_composing);
                     let mut layouts = LAYOUT_CACHE.lock().unwrap();
                     let event_info = PartialKeyEventInfo::from_message(
                         wparam,
                         lparam,
                         ElementState::Released,
                         &mut layouts,
+                        is_ime,
                     );
                     // We MUST release the layout lock before calling `next_kbd_msg`, otherwise it
                     // may deadlock
@@ -286,11 +321,10 @@ impl KeyEventBuilder {
                         }
                     }
                     if let Some(event_info) = valid_event_info {
-                        let event = event_info.finalize();
-                        return MatchResult::MessagesToDispatch(self.pending.complete_pending(
-                            pending_token,
-                            MessageAsKeyEvent { event, is_synthetic: false },
-                        ));
+                        let event = event_info.finalize_native();
+                        return MatchResult::MessagesToDispatch(
+                            self.pending.complete_pending(pending_token, event),
+                        );
                     }
                     MatchResult::TokenToRemove(pending_token)
                 },
@@ -298,11 +332,58 @@ impl KeyEventBuilder {
             }
         };
         let matcher_result = matcher();
-        match matcher_result {
+        let mut events = match matcher_result {
             MatchResult::TokenToRemove(t) => self.pending.remove_pending(t),
             MatchResult::MessagesToDispatch(m) => m,
             MatchResult::Nothing => Vec::new(),
-        }
+        };
+        events.retain(|event| !event.is_ime);
+        events
+    }
+
+    /// Capture the queue baseline before any composition callbacks run.
+    pub(crate) fn begin_composition(&self) -> io::Result<()> {
+        let held = PressedKeys::capture();
+
+        // Query native state before locking: no lock crosses an OS call that
+        // might reenter the native event loop. A failed snapshot disables capture;
+        // the original error is returned so the window callback can diagnose it.
+        self.ime_keys
+            .lock()
+            .expect("an earlier panic left composition key ownership inconsistent")
+            .begin_composition(held.as_ref().ok().copied());
+        held.map(|_| ())
+    }
+
+    /// Retain a cancellation press held at native composition completion.
+    pub(crate) fn end_composition(&self) -> io::Result<()> {
+        let held = PressedKeys::capture();
+        self.ime_keys
+            .lock()
+            .expect("an earlier panic left composition key ownership inconsistent")
+            .end_composition(held.as_ref().ok().copied());
+        held.map(|_| ())
+    }
+
+    fn ime_key(
+        &self,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        state: ElementState,
+        composing: bool,
+    ) -> bool {
+        let key = destructure_key_lparam(lparam);
+        self.ime_keys
+            .lock()
+            .expect("an earlier panic left composition key ownership inconsistent")
+            .filter_key(
+                wparam as VIRTUAL_KEY,
+                key.scancode,
+                key.extended,
+                state,
+                composing,
+                key.is_repeat,
+            )
     }
 
     // Allowing nominimal_bool lint because the `is_key_pressed` macro triggers this warning
@@ -438,6 +519,7 @@ impl KeyEventBuilder {
         };
         let event_info = PartialKeyEventInfo {
             vkey: vk,
+            is_ime: false,
             logical_key: PartialLogicalKey::This(logical_key.clone()),
             key_without_modifiers,
             key_state,
@@ -451,7 +533,7 @@ impl KeyEventBuilder {
         let mut event = event_info.finalize();
         event.logical_key = logical_key;
         event.text_with_all_modifiers = text;
-        Some(MessageAsKeyEvent { event, is_synthetic: true })
+        Some(MessageAsKeyEvent { event, is_synthetic: true, is_ime: false })
     }
 }
 
@@ -473,6 +555,9 @@ enum PartialLogicalKey {
 }
 
 struct PartialKeyEventInfo {
+    // This describes the original keydown/keyup, not the IME state when a later
+    // WM_CHAR or a pending keyboard event finally completes this event.
+    is_ime: bool,
     vkey: VIRTUAL_KEY,
     key_state: ElementState,
     is_repeat: bool,
@@ -495,6 +580,7 @@ impl PartialKeyEventInfo {
         lparam: LPARAM,
         state: ElementState,
         layouts: &mut MutexGuard<'_, LayoutCache>,
+        is_ime: bool,
     ) -> Self {
         const NO_MODS: WindowsModifiers = WindowsModifiers::empty();
 
@@ -571,6 +657,7 @@ impl PartialKeyEventInfo {
         };
 
         PartialKeyEventInfo {
+            is_ime,
             vkey,
             key_state: state,
             logical_key,
@@ -581,6 +668,11 @@ impl PartialKeyEventInfo {
             utf16parts: Vec::with_capacity(8),
             text: PartialText::System(Vec::new()),
         }
+    }
+
+    fn finalize_native(self) -> MessageAsKeyEvent {
+        let is_ime = self.is_ime;
+        MessageAsKeyEvent { event: self.finalize(), is_synthetic: false, is_ime }
     }
 
     fn finalize(self) -> KeyEvent {
@@ -1261,4 +1353,279 @@ pub fn scancode_to_physicalkey(scancode: u32) -> PhysicalKey {
 
         _ => return PhysicalKey::Unidentified(NativeKeyCode::Windows(scancode as u16)),
     })
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        VK_BACK, VK_CAPITAL, VK_ESCAPE, VK_PROCESSKEY,
+    };
+    use winit_core::event::ElementState;
+    use winit_core::keyboard::{Key, KeyCode, KeyLocation, NamedKey, PhysicalKey};
+
+    use crate::ime::PressedKeys;
+    use crate::keyboard::{
+        KeyEventBuilder, MessageAsKeyEvent, PartialKeyEventInfo, PartialLogicalKey, PartialText,
+        PendingEventQueue,
+    };
+
+    fn escape(is_ime: bool) -> PartialKeyEventInfo {
+        PartialKeyEventInfo {
+            is_ime,
+            vkey: VK_ESCAPE,
+            key_state: ElementState::Pressed,
+            is_repeat: false,
+            physical_key: PhysicalKey::Code(KeyCode::Escape),
+            location: KeyLocation::Standard,
+            logical_key: PartialLogicalKey::This(Key::Named(NamedKey::Escape)),
+            key_without_modifiers: Key::Named(NamedKey::Escape),
+            utf16parts: Vec::new(),
+            text: PartialText::System(Vec::new()),
+        }
+    }
+
+    #[track_caller]
+    fn queue_character() {
+        use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            MSG, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, WM_CHAR,
+        };
+
+        // SAFETY: All-zero scalar/pointer MSG fields are valid initialized input.
+        let mut message: MSG = unsafe { std::mem::zeroed() };
+
+        // SAFETY: The fresh test thread owns no windows. Peek creates its private
+        // queue and writes only to the live MSG; the posted character targets
+        // this same thread, never the maintainer's desktop or another process.
+        let posted = unsafe {
+            PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+            PostThreadMessageW(GetCurrentThreadId(), WM_CHAR, usize::from(b'a'), 0)
+        };
+        assert_ne!(posted, 0, "posting the fixture character must succeed");
+    }
+
+    #[track_caller]
+    fn take_character() -> windows_sys::Win32::UI::WindowsAndMessaging::MSG {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_CHAR};
+
+        // SAFETY: Zero initializes only scalar/pointer fields; Peek writes to a
+        // live MSG and removes only the fixture character from this test thread.
+        let mut message: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: The filter removes only the fixture character from this fresh
+        // test thread's queue and writes to the initialized local MSG.
+        let found = unsafe {
+            PeekMessageW(&mut message, std::ptr::null_mut(), WM_CHAR, WM_CHAR, PM_REMOVE)
+        };
+        assert_ne!(found, 0, "the keydown peek must leave the character queued");
+        message
+    }
+
+    #[test]
+    fn native_message_assembly_filters_composition_and_preserves_fresh_input() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_A;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_KEYUP};
+
+        // A dedicated thread gives the real PeekMessage path an empty queue and
+        // discards it even if an assertion fails. No window or display is needed.
+        std::thread::spawn(|| {
+            const A_SCANCODE: isize = 0x1e << 16;
+            const KEYDOWN: isize = A_SCANCODE | 1;
+            const KEYUP: isize = KEYDOWN | (1 << 30) | (1 << 31);
+            let builder = KeyEventBuilder::default();
+            let mut result = crate::event_loop::ProcResult::DefWindowProc(0);
+
+            queue_character();
+            builder.begin_composition().unwrap();
+            assert!(
+                builder
+                    .process_message(
+                        std::ptr::null_mut(),
+                        WM_KEYDOWN,
+                        usize::from(VK_A),
+                        KEYDOWN,
+                        &mut result,
+                        true,
+                    )
+                    .is_empty()
+            );
+
+            // Composition ends between the real keydown/character assembly
+            // calls. Ownership must follow the partial event into the filter.
+            builder.end_composition().unwrap();
+            let character = take_character();
+            assert!(
+                builder
+                    .process_message(
+                        std::ptr::null_mut(),
+                        character.message,
+                        character.wParam,
+                        character.lParam,
+                        &mut result,
+                        false,
+                    )
+                    .is_empty()
+            );
+            assert!(
+                builder
+                    .process_message(
+                        std::ptr::null_mut(),
+                        WM_KEYUP,
+                        usize::from(VK_A),
+                        KEYUP,
+                        &mut result,
+                        false,
+                    )
+                    .is_empty()
+            );
+
+            queue_character();
+            assert!(
+                builder
+                    .process_message(
+                        std::ptr::null_mut(),
+                        WM_KEYDOWN,
+                        usize::from(VK_A),
+                        KEYDOWN,
+                        &mut result,
+                        false,
+                    )
+                    .is_empty()
+            );
+            let character = take_character();
+            let events = builder.process_message(
+                std::ptr::null_mut(),
+                character.message,
+                character.wParam,
+                character.lParam,
+                &mut result,
+                false,
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.text.as_deref(), Some("a"));
+
+            let events = builder.process_message(
+                std::ptr::null_mut(),
+                WM_KEYUP,
+                usize::from(VK_A),
+                KEYUP,
+                &mut result,
+                false,
+            );
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event.state, ElementState::Released);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn native_fresh_caps_lock_press_retires_ownership_after_a_lost_release() {
+        // Microsoft Japanese IME can send PROCESSKEY for CapsLock with no later
+        // release. Its next ordinary press must survive without losing focus.
+        const CAPS_LOCK_DOWN: isize = 0x3a << 16;
+        let builder = KeyEventBuilder::default();
+
+        assert!(builder.ime_key(
+            VK_PROCESSKEY.into(),
+            CAPS_LOCK_DOWN,
+            ElementState::Pressed,
+            false,
+        ));
+        assert!(!builder.ime_key(VK_CAPITAL.into(), CAPS_LOCK_DOWN, ElementState::Pressed, false));
+        assert!(!builder.ime_key(VK_CAPITAL.into(), CAPS_LOCK_DOWN, ElementState::Released, false));
+    }
+
+    #[test]
+    fn native_backspace_repeats_resume_after_preedit_hands_input_back() {
+        // This is the native sequence after holding Backspace to delete Korean
+        // preedit: PROCESSKEY repeats become ordinary VK_BACK repeats when empty.
+        const BACKSPACE_DOWN: isize = 0x0e << 16;
+        const PREVIOUSLY_DOWN: isize = 1 << 30;
+        let builder = KeyEventBuilder::default();
+
+        assert!(builder.ime_key(VK_PROCESSKEY.into(), BACKSPACE_DOWN, ElementState::Pressed, true));
+        assert!(builder.ime_key(
+            VK_BACK.into(),
+            BACKSPACE_DOWN | PREVIOUSLY_DOWN,
+            ElementState::Pressed,
+            true,
+        ));
+
+        assert!(!builder.ime_key(
+            VK_BACK.into(),
+            BACKSPACE_DOWN | PREVIOUSLY_DOWN,
+            ElementState::Pressed,
+            false,
+        ));
+        assert!(!builder.ime_key(VK_BACK.into(), BACKSPACE_DOWN, ElementState::Released, false));
+    }
+
+    #[test]
+    fn the_original_composition_press_is_retained_after_ime_ends() {
+        // WM_KEYDOWN's scancode is stored in lParam bits 16..23. No native calls
+        // are needed to exercise the prepare/assemble/release protocol itself.
+        const ESCAPE_LPARAM: isize = 0x01 << 16;
+        const PREVIOUSLY_DOWN: isize = 1 << 30;
+        let builder = KeyEventBuilder::default();
+
+        // Native queue state already includes Escape when IMM completes, before
+        // posting its ordinary key message. This fixture needs no OS queries.
+        const VIRTUAL_KEY_COUNT: usize = u8::MAX as usize + 1;
+        const KEY_DOWN: u8 = 1 << 7;
+        let mut native = [0; VIRTUAL_KEY_COUNT];
+        builder
+            .ime_keys
+            .lock()
+            .unwrap()
+            .begin_composition(Some(PressedKeys::from_native_state(native)));
+        native[VK_ESCAPE as usize] = KEY_DOWN;
+        builder
+            .ime_keys
+            .lock()
+            .unwrap()
+            .end_composition(Some(PressedKeys::from_native_state(native)));
+
+        // PeekMessage has now delivered Commit and Disabled. The native
+        // window callback still recognizes the Escape already owned by the IME.
+        let is_ime = builder.ime_key(VK_ESCAPE.into(), ESCAPE_LPARAM, ElementState::Pressed, false);
+        assert!(escape(is_ime).finalize_native().is_ime);
+        assert!(builder.ime_key(
+            VK_ESCAPE.into(),
+            ESCAPE_LPARAM | PREVIOUSLY_DOWN,
+            ElementState::Pressed,
+            false
+        ));
+        assert!(builder.ime_key(VK_ESCAPE.into(), ESCAPE_LPARAM, ElementState::Released, false));
+
+        let fresh = builder.ime_key(VK_ESCAPE.into(), ESCAPE_LPARAM, ElementState::Pressed, false);
+        assert!(!escape(fresh).finalize_native().is_ime);
+    }
+
+    #[test]
+    fn a_key_retains_composition_ownership_when_a_later_char_completes_it() {
+        // The original keydown is received during preedit. Its WM_CHAR arrives
+        // after empty preedit, Commit and Disabled, as with Microsoft Korean IME.
+        let mut partial = escape(true);
+        partial.utf16parts.push(u16::from(b'\x1b'));
+        let event = partial.finalize_native();
+        assert!(event.is_ime);
+        assert_eq!(event.event.logical_key, Key::Named(NamedKey::Escape));
+
+        let fresh_escape = escape(false).finalize_native();
+        assert!(!fresh_escape.is_ime);
+        assert_eq!(fresh_escape.event.logical_key, Key::Named(NamedKey::Escape));
+    }
+
+    #[test]
+    fn reentrant_pending_completion_retains_each_keys_original_ime_ownership() {
+        let pending = PendingEventQueue::<MessageAsKeyEvent>::default();
+        let first = pending.add_pending();
+        let second = pending.add_pending();
+        assert!(pending.complete_pending(second, escape(false).finalize_native()).is_empty());
+
+        let events = pending.complete_pending(first, escape(true).finalize_native());
+        assert_eq!(events.len(), 2);
+        assert!(events[0].is_ime);
+        assert!(!events[1].is_ime);
+    }
 }

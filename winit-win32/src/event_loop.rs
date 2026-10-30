@@ -1212,6 +1212,14 @@ unsafe fn public_window_callback_inner(
 ) -> LRESULT {
     let mut result = ProcResult::DefWindowProc(wparam);
 
+    // Preserve composition ownership while assembling a key across reentrant
+    // PeekMessage calls. The native completion snapshot additionally retains a
+    // canceling Escape forwarded after preedit ends, without consuming normal
+    // text or navigation forwarded after a commit.
+    // https://github.com/rust-windowing/winit/issues/4508
+    let is_composing = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN)
+        && userdata.window_state_lock().ime_state == ImeState::Preedit;
+
     // Send new modifiers before sending key events.
     let mods_changed_callback = || match msg {
         WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP => {
@@ -1227,8 +1235,14 @@ unsafe fn public_window_callback_inner(
 
     let keyboard_callback = || {
         use winit_core::event::WindowEvent::KeyboardInput;
-        let events =
-            userdata.key_event_builder.process_message(window, msg, wparam, lparam, &mut result);
+        let events = userdata.key_event_builder.process_message(
+            window,
+            msg,
+            wparam,
+            lparam,
+            &mut result,
+            is_composing,
+        );
         for event in events {
             userdata.send_window_event(window, KeyboardInput {
                 device_id: None,
@@ -1610,6 +1624,10 @@ unsafe fn public_window_callback_inner(
             if ime_allowed {
                 userdata.window_state_lock().ime_state = ImeState::Enabled;
 
+                if let Err(error) = userdata.key_event_builder.begin_composition() {
+                    tracing::warn!(%error, "failed to capture keys held before composition");
+                }
+
                 userdata.send_window_event(window, WindowEvent::Ime(Ime::Enabled));
             }
 
@@ -1673,6 +1691,13 @@ unsafe fn public_window_callback_inner(
                 w.ime_capabilities.is_some() || w.ime_state != ImeState::Disabled
             };
             if ime_allowed_or_composing {
+                // Korean IMM can forward a canceling Escape after composition
+                // ends. Capture that press before callbacks change native focus;
+                // other forwarded keys may intentionally continue normal editing.
+                if let Err(error) = userdata.key_event_builder.end_composition() {
+                    tracing::warn!(%error, "failed to capture keys held when composition ended");
+                }
+
                 if userdata.window_state_lock().ime_state == ImeState::Preedit {
                     // Windows Hangul IME sends WM_IME_COMPOSITION after WM_IME_ENDCOMPOSITION, so
                     // trying receiving composing result and commit if exists.
