@@ -1665,6 +1665,9 @@ impl WindowDelegate {
 
         view.set_cursor_icon(cursor);
         self.window().invalidateCursorRectsForView(&view);
+        // Cursor rectangles only apply in the key window; an application usually selects a
+        // new cursor in response to pointer movement, after `mouseMoved:` has already run.
+        view.show_cursor_outside_key_window();
     }
 
     #[inline]
@@ -1689,6 +1692,7 @@ impl WindowDelegate {
         let state_changed = view.set_cursor_visible(visible);
         if state_changed {
             self.window().invalidateCursorRectsForView(&view);
+            view.show_cursor_outside_key_window();
         }
     }
 

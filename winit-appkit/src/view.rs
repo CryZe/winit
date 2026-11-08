@@ -323,14 +323,8 @@ define_class!(
         #[unsafe(method(resetCursorRects))]
         fn reset_cursor_rects(&self) {
             let _entered = debug_span!("resetCursorRects").entered();
-            let bounds = self.bounds();
-            let cursor_state = self.ivars().cursor_state.borrow();
             // We correctly invoke `addCursorRect` only from inside `resetCursorRects`
-            if cursor_state.visible {
-                self.addCursorRect_cursor(bounds, &cursor_state.cursor);
-            } else {
-                self.addCursorRect_cursor(bounds, &invisible_cursor());
-            }
+            self.addCursorRect_cursor(self.bounds(), &self.effective_cursor());
         }
     }
 
@@ -777,6 +771,7 @@ define_class!(
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let _entered = debug_span!("mouseMoved:").entered();
+            self.show_cursor_outside_key_window();
             if self.handle_event(event) {
                 return;
             }
@@ -816,6 +811,10 @@ define_class!(
         #[unsafe(method(mouseEntered:))]
         fn mouse_entered(&self, event: &NSEvent) {
             let _entered = debug_span!("mouseEntered:").entered();
+
+            // The cursor still shows whatever the window or application under the pointer
+            // last selected. A key window's cursor rectangle replaces it; others need this.
+            self.show_cursor_outside_key_window();
 
             let position = self.mouse_view_point(event).to_physical(self.scale_factor());
 
@@ -1208,6 +1207,53 @@ impl WinitView {
 
     pub(super) fn cursor_icon(&self) -> Retained<NSCursor> {
         self.ivars().cursor_state.borrow().cursor.clone()
+    }
+
+    /// The cursor shown over the view: the selected one, or an invisible one while hidden.
+    fn effective_cursor(&self) -> Retained<NSCursor> {
+        let cursor_state = self.ivars().cursor_state.borrow();
+        if cursor_state.visible { cursor_state.cursor.clone() } else { invisible_cursor() }
+    }
+
+    /// Show the view's cursor while the pointer is over it and its window is not key.
+    ///
+    /// AppKit only applies cursor rectangles (see `resetCursorRects`) in the key window. The
+    /// view's tracking area is `ActiveAlways`, so pointer events and hover feedback reach
+    /// windows that are not key, but nothing changed the cursor there: it kept whatever another
+    /// window or application last showed (an I-beam or a resize cursor, for example) until the
+    /// window became key. The other desktop backends show the selected cursor over an unfocused
+    /// window (Windows answers `WM_SETCURSOR`, X11 and Wayland attach the cursor to the window
+    /// or pointer surface), so it is set directly here instead.
+    ///
+    /// `NSTrackingAreaOptions::CursorUpdate` is no alternative: AppKit does not send
+    /// `cursorUpdate:` for tracking areas that are also `ActiveAlways`.
+    ///
+    /// The cursor is only set while no other window, of any application, covers the pointer,
+    /// so a window that is not key never changes the cursor shown over another one. The key
+    /// window keeps relying on its cursor rectangle.
+    pub(super) fn show_cursor_outside_key_window(&self) {
+        // A detached view has no window whose cursor it could show.
+        let Some(window) = (**self).window() else {
+            return;
+        };
+        if window.isKeyWindow() {
+            return;
+        }
+
+        let location = NSEvent::mouseLocation();
+        let topmost = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(
+            location,
+            0,
+            MainThreadMarker::from(self),
+        );
+        if topmost != window.windowNumber() {
+            return;
+        }
+
+        let point = self.convertPoint_fromView(window.convertPointFromScreen(location), None);
+        if self.mouse_inRect(point, self.bounds()) {
+            self.effective_cursor().set();
+        }
     }
 
     pub(super) fn set_cursor_icon(&self, icon: Retained<NSCursor>) {
