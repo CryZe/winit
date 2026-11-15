@@ -142,8 +142,14 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                 let mut text_input_data = data.inner.lock().unwrap();
 
                 // The serial says how many of our commits the input method knew of when it
-                // produced these events, whatever happens to them below.
-                text_input_data.sync.done(serial);
+                // produced these events, whatever happens to them below. If state was held back
+                // until now, the event loop must reach the end of this iteration to send it
+                // (`flush_held_state`), even when this `done` delivers no event: while waiting it
+                // otherwise goes back to polling and the state stays unsent until something else
+                // wakes it.
+                if text_input_data.sync.done(serial) {
+                    state.dispatched_events = true;
+                }
 
                 // Just in case some IME sends an event for the disabled window.
                 if window.is_some() && client_state.is_none() {
@@ -350,6 +356,10 @@ struct Sync {
     /// number, oldest first. Holding back state keeps this short; enable and disable requests,
     /// which are never held back, can add more, so it is capped.
     in_flight: VecDeque<(u32, Option<ImeSurroundingText>)>,
+    /// The newest commit whose text the cap dropped while unacknowledged, until a later commit
+    /// is acknowledged. A `done` naming it, or one between it and the oldest kept commit, names
+    /// a text that is gone.
+    dropped: Option<u32>,
 }
 
 /// The most unacknowledged commits whose surrounding text is kept. Holding back state allows one
@@ -359,19 +369,32 @@ const MAX_IN_FLIGHT: usize = 8;
 
 impl Sync {
     /// Records a `done` event: the text of the commit its serial names, and any earlier one,
-    /// becomes the text the input method knows.
-    fn done(&mut self, serial: u32) {
+    /// becomes the text the input method knows. Returns whether held-back state is now due.
+    fn done(&mut self, serial: u32) -> bool {
         self.done_serial = serial;
+        let mut acknowledged = false;
 
         // Commit numbers and serials wrap; a commit is acknowledged when it is not after the
-        // serial, which is within half the range before it.
+        // serial (see `not_after`).
         while let Some(&(commit, _)) = self.in_flight.front() {
-            if serial.wrapping_sub(commit) > u32::MAX / 2 {
+            if !not_after(commit, serial) {
                 break;
             }
 
             self.known = self.in_flight.pop_front().and_then(|(_, surrounding)| surrounding);
+            acknowledged = true;
         }
+
+        // Every kept commit is newer than a dropped one, so acknowledging one leaves nothing
+        // dropped to name. Otherwise a serial at or after the dropped commit names a text that
+        // is gone, and keeping an older one would count deletions from the wrong text.
+        if acknowledged {
+            self.dropped = None;
+        } else if self.dropped.is_some_and(|dropped| not_after(dropped, serial)) {
+            self.known = None;
+        }
+
+        self.flush_due()
     }
 
     /// Whether new state may go out now. Otherwise it is marked as held back.
@@ -392,7 +415,7 @@ impl Sync {
         self.held_back = false;
 
         if self.in_flight.len() == MAX_IN_FLIGHT {
-            self.in_flight.pop_front();
+            self.dropped = self.in_flight.pop_front().map(|(commit, _)| commit);
         }
 
         self.in_flight.push_back((self.commits, surrounding_text));
@@ -432,6 +455,12 @@ impl Sync {
             ImeSurroundingText::new(text, cursor, cursor).ok().map(|text| text.with_offset(offset))
         });
     }
+}
+
+/// Whether commit number `commit` is not after `serial`, as both wrap: it is when it lies within
+/// half the range before the serial.
+fn not_after(commit: u32, serial: u32) -> bool {
+    serial.wrapping_sub(commit) <= u32::MAX / 2
 }
 
 /// The Data associated with the text input.
@@ -744,6 +773,46 @@ mod tests {
         assert_eq!(sync.surrounding_text(), None);
         sync.done(2);
         assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 1, 1)));
+    }
+
+    #[test]
+    fn a_done_naming_a_dropped_text_forgets_the_older_one() {
+        // The input method knows "abcdefghi" from commit 1. Enabling and disabling then send so
+        // many commits that the text of commit 2 is dropped. A late `done` naming commit 2 must
+        // not leave commit 1's text as the input method's view.
+        let mut sync = acknowledged(surrounding("abcdefghi", 0, 0));
+        for caret in 1..=MAX_IN_FLIGHT + 1 {
+            sync.committed(Some(surrounding("abcdefghi", caret, caret)));
+        }
+        assert_eq!(sync.in_flight.front().map(|&(commit, _)| commit), Some(3));
+
+        // A repeated older `done` still names commit 1.
+        sync.done(1);
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 0, 0)));
+        sync.done(2);
+        assert_eq!(sync.surrounding_text(), None);
+
+        // Acknowledging a kept commit makes its text known again.
+        sync.done(3);
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 2, 2)));
+        sync.done(3);
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 2, 2)));
+    }
+
+    #[test]
+    fn done_reports_when_held_back_state_is_due() {
+        // The `done` that catches up with held-back state reports it, so the event loop sends
+        // the state even if that `done` delivers no event.
+        let mut sync = Sync::default();
+        sync.committed(Some(surrounding("abc", 3, 3)));
+        assert!(!sync.may_send());
+        assert!(!sync.done(0));
+        assert!(sync.done(1));
+
+        // Nothing was held back: nothing is due.
+        let mut sync = Sync::default();
+        sync.committed(Some(surrounding("abc", 3, 3)));
+        assert!(!sync.done(1));
     }
 
     #[test]
