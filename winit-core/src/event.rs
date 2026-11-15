@@ -16,7 +16,7 @@ use crate::event_loop::{AsyncRequestSerial, DndAction};
 use crate::keyboard::{self, ModifiersKeyState, ModifiersKeys, ModifiersState};
 #[cfg(doc)]
 use crate::window::Window;
-use crate::window::{ActivationToken, Theme};
+use crate::window::{ActivationToken, ImeSurroundingText, Theme};
 
 /// Describes the reason the event loop is resuming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1088,11 +1088,20 @@ pub enum Ime {
     /// then execute the deletion, then insert the removed text back.
     ///
     /// This event assumes text is stored in UTF-8.
+    ///
+    /// The counts are relative to the selection in `surrounding_text`, the input method's view
+    /// of the text, which the application may have changed since. An application that shares
+    /// surrounding text should check that the request still fits its current text, as Chromium
+    /// does, instead of applying the counts around its current selection.
     DeleteSurrounding {
         /// Bytes to remove before the selection
         before_bytes: usize,
         /// Bytes to remove after the selection
         after_bytes: usize,
+        /// The surrounding text the input method computed the request against: the last one
+        /// sent to it, followed by its own edits since. `None` when the backend does not know
+        /// it, for example because the application shared none.
+        surrounding_text: Option<ImeSurroundingText>,
     },
 
     /// Notifies when the IME was disabled.

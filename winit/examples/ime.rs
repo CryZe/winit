@@ -225,7 +225,7 @@ impl App {
                 surface.window().request_ime_update(ImeRequest::Update(request_data)).unwrap();
                 self.print_input_state();
             },
-            Ime::DeleteSurrounding { before_bytes, after_bytes } => {
+            Ime::DeleteSurrounding { before_bytes, after_bytes, .. } => {
                 let (text, cursor) = &self.input_state.text_and_cursor();
 
                 // To anyone copying this, keep in mind that this doesn't take text
