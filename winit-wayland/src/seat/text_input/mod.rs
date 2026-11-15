@@ -356,9 +356,9 @@ struct Sync {
     /// number, oldest first. Holding back state keeps this short; enable and disable requests,
     /// which are never held back, can add more, so it is capped.
     in_flight: VecDeque<(u32, Option<ImeSurroundingText>)>,
-    /// The newest commit whose text the cap dropped while unacknowledged, until a later commit
-    /// is acknowledged. A `done` naming it, or one between it and the oldest kept commit, names
-    /// a text that is gone.
+    /// The oldest commit whose text the cap dropped since a commit was last acknowledged. Every
+    /// commit from it to the oldest kept one is dropped, so a `done` naming any of them names a
+    /// text that is gone.
     dropped: Option<u32>,
 }
 
@@ -386,8 +386,8 @@ impl Sync {
         }
 
         // Every kept commit is newer than a dropped one, so acknowledging one leaves nothing
-        // dropped to name. Otherwise a serial at or after the dropped commit names a text that
-        // is gone, and keeping an older one would count deletions from the wrong text.
+        // dropped to name. Otherwise a serial at or after the oldest dropped commit names one of
+        // the dropped texts, and keeping an older one would count deletions from the wrong text.
         if acknowledged {
             self.dropped = None;
         } else if self.dropped.is_some_and(|dropped| not_after(dropped, serial)) {
@@ -414,8 +414,10 @@ impl Sync {
         self.commits = self.commits.wrapping_add(1);
         self.held_back = false;
 
-        if self.in_flight.len() == MAX_IN_FLIGHT {
-            self.dropped = self.in_flight.pop_front().map(|(commit, _)| commit);
+        if self.in_flight.len() == MAX_IN_FLIGHT
+            && let Some((commit, _)) = self.in_flight.pop_front()
+        {
+            self.dropped.get_or_insert(commit);
         }
 
         self.in_flight.push_back((self.commits, surrounding_text));
@@ -797,6 +799,27 @@ mod tests {
         assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 2, 2)));
         sync.done(3);
         assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 2, 2)));
+    }
+
+    #[test]
+    fn a_done_naming_any_dropped_text_forgets_the_older_one() {
+        // Commits 2 to 4 are dropped. A late `done` naming the oldest of them, 2, names a text
+        // that is gone as much as one naming 4 does, also where the commit numbers wrap.
+        for first in [0, u32::MAX - 2] {
+            let mut sync = Sync { commits: first, done_serial: first, ..Sync::default() };
+            let acknowledged = first.wrapping_add(1);
+            sync.committed(Some(surrounding("abcdefghi", 0, 0)));
+            sync.done(acknowledged);
+            for caret in 1..=MAX_IN_FLIGHT + 3 {
+                sync.committed(Some(surrounding("abcdefghi", caret % 9, caret % 9)));
+            }
+            assert_eq!(sync.dropped, Some(acknowledged.wrapping_add(1)));
+
+            sync.done(acknowledged);
+            assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 0, 0)));
+            sync.done(acknowledged.wrapping_add(1));
+            assert_eq!(sync.surrounding_text(), None, "the oldest dropped commit");
+        }
     }
 
     #[test]
