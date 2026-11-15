@@ -35,7 +35,9 @@ use text_input::TextInputData;
 pub use text_input::{ClientState as TextInputClientState, TextInputState};
 use touch::TouchPoint;
 
-pub(crate) use crate::seat::text_input::ZwpTextInputV3Ext;
+pub(crate) use crate::seat::text_input::{
+    ZwpTextInputV3Ext, flush_held_state as flush_held_text_input_state,
+};
 
 #[derive(Debug, Default)]
 pub struct WinitSeatState {

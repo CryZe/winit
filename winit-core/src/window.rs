@@ -1932,6 +1932,9 @@ pub struct ImeSurroundingText {
     /// The position of the other end of selection, in bytes.
     /// With no selection, it should be the same as the cursor.
     anchor: usize,
+    /// Where the excerpt starts in the application's whole text, in units the application
+    /// chooses. Backends never interpret it.
+    offset: usize,
 }
 
 impl ImeSurroundingText {
@@ -1984,7 +1987,24 @@ impl ImeSurroundingText {
             return Err(ImeSurroundingTextError::AnchorBadPosition);
         };
 
-        Ok(Self { text, cursor, anchor })
+        Ok(Self { text, cursor, anchor, offset: 0 })
+    }
+
+    /// Records where the excerpt starts in the application's whole text, in units the
+    /// application chooses (0 unless set). Backends never interpret it, but pass it back with
+    /// requests computed against the excerpt, such as [`Ime::DeleteSurrounding`], so that an
+    /// application which shares an excerpt of a longer text can tell where a request falls even
+    /// after it has moved the excerpt.
+    ///
+    /// [`Ime::DeleteSurrounding`]: crate::event::Ime::DeleteSurrounding
+    pub fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
+    }
+
+    /// Where the excerpt starts in the application's whole text (see [`Self::with_offset`]).
+    pub fn offset(&self) -> usize {
+        self.offset
     }
 
     /// Consumes the object, releasing the text string only.

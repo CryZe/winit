@@ -2,7 +2,7 @@ use sctk::reexports::protocols::wp::text_input::zv3::client::zwp_text_input_v3::
 use winit_core::window::{ImeCapabilities, ImeRequest, ImeRequestError};
 
 use super::WindowState;
-use crate::seat::{TextInputClientState, ZwpTextInputV3Ext};
+use crate::seat::{TextInputClientState, ZwpTextInputV3Ext, flush_held_text_input_state};
 
 impl WindowState {
     /// Whether the IME is allowed.
@@ -65,6 +65,14 @@ impl WindowState {
         }
 
         if state_change { Ok(Some(self.text_input_state.is_some())) } else { Ok(None) }
+    }
+
+    /// Sends input method state held back while an input method was behind, once it has caught
+    /// up. The event loop calls this after the application's callbacks of an iteration.
+    pub(crate) fn flush_held_text_input_state(&self) {
+        for text_input in &self.text_inputs {
+            flush_held_text_input_state(text_input, self.text_input_state.as_ref());
+        }
     }
 
     /// Register text input on the top-level.

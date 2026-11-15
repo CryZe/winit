@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ops::Deref;
 
 use dpi::{LogicalPosition, LogicalSize};
@@ -218,16 +219,32 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WinitState> for TextInputState {
                     );
                 }
 
-                // State the application changed while the input method was behind goes out now
-                // that it has caught up, as Chromium does.
-                if let Some(client_state) = client_state {
-                    if text_input_data.sync.flush_due() {
-                        send_state(text_input, &mut text_input_data, Some(client_state), false);
-                    }
-                }
+                // State held back while the input method was behind goes out at the end of the
+                // event loop iteration (`flush_held_state`), once the application has handled
+                // these events. Sending it now would tell the input method the text from before
+                // its own edits, which the application is about to apply.
             },
             _ => {},
         }
+    }
+}
+
+/// Sends state that was held back while the input method was behind, now that it has caught
+/// up, as Chromium does once its client has handled the input method's events
+/// (`ZwpTextInputV3Impl::SendPendingImeData`). The event loop calls this after the application's
+/// callbacks for an iteration, so the state is the application's latest, including its response
+/// to the input method's edits.
+///
+/// The text input's data must not be locked by the caller.
+pub(crate) fn flush_held_state(text_input: &ZwpTextInputV3, state: Option<&ClientState>) {
+    let Some(state) = state else {
+        return;
+    };
+    let data = text_input.data::<TextInputData>().expect("text inputs are created with their data");
+    let mut text_input_data = data.inner.lock().unwrap();
+
+    if text_input_data.sync.flush_due() {
+        send_state(text_input, &mut text_input_data, Some(state), false);
     }
 }
 
@@ -307,12 +324,17 @@ fn send_state(
 /// arrives, and Chromium does so (`ZwpTextInputV3Impl::SendPendingImeData`). Otherwise the input
 /// method computes its edits against text that has already changed under it.
 ///
-/// It also keeps the surrounding text the input method last received, updated by the edits the
-/// input method has made since, because `delete_surrounding_text` counts from the selection in
-/// that text rather than from the application's current one. The application compares it with
-/// its current text to tell whether a deletion still applies. This relies on compositors sending
-/// `done` after the commits they forward, as Chromium does too: a compositor that never answers
-/// a commit leaves later state held back until the next enable.
+/// It also keeps the surrounding text the input method knows, because `delete_surrounding_text`
+/// counts from the selection in that text rather than from the application's current one. Events
+/// that arrive with an older serial still apply, as the protocol requires, against the text of the
+/// commit that serial names, so the text of every commit not yet acknowledged is kept until a
+/// `done` names it or a later one. The input method's own edits since (deletions, commit strings,
+/// a preedit replacing the selection) are followed in the known text until the next
+/// acknowledged commit replaces it. The application compares it with its current text to tell
+/// whether a deletion still applies.
+///
+/// This relies on compositors answering commits with `done`, as Chromium does too: a compositor
+/// that never answers a commit leaves later state held back until the next enable.
 #[derive(Debug, Default)]
 struct Sync {
     /// The number of `commit` requests sent, wrapping as the serial does.
@@ -323,13 +345,33 @@ struct Sync {
     held_back: bool,
     /// The surrounding text the input method knows, if it was given one and our updates of it
     /// could follow its edits.
-    surrounding_text: Option<ImeSurroundingText>,
+    known: Option<ImeSurroundingText>,
+    /// The surrounding text of each commit the input method has not acknowledged yet, by commit
+    /// number, oldest first. Holding back state keeps this short; enable and disable requests,
+    /// which are never held back, can add more, so it is capped.
+    in_flight: VecDeque<(u32, Option<ImeSurroundingText>)>,
 }
 
+/// The most unacknowledged commits whose surrounding text is kept. Holding back state allows one
+/// at a time; enabling and disabling bypass that, so a few more can be outstanding. A compositor
+/// further behind than this has stopped answering, and the oldest texts are dropped.
+const MAX_IN_FLIGHT: usize = 8;
+
 impl Sync {
-    /// Records a `done` event.
+    /// Records a `done` event: the text of the commit its serial names, and any earlier one,
+    /// becomes the text the input method knows.
     fn done(&mut self, serial: u32) {
         self.done_serial = serial;
+
+        // Commit numbers and serials wrap; a commit is acknowledged when it is not after the
+        // serial, which is within half the range before it.
+        while let Some(&(commit, _)) = self.in_flight.front() {
+            if serial.wrapping_sub(commit) > u32::MAX / 2 {
+                break;
+            }
+
+            self.known = self.in_flight.pop_front().and_then(|(_, surrounding)| surrounding);
+        }
     }
 
     /// Whether new state may go out now. Otherwise it is marked as held back.
@@ -348,29 +390,36 @@ impl Sync {
     fn committed(&mut self, surrounding_text: Option<ImeSurroundingText>) {
         self.commits = self.commits.wrapping_add(1);
         self.held_back = false;
-        self.surrounding_text = surrounding_text;
+
+        if self.in_flight.len() == MAX_IN_FLIGHT {
+            self.in_flight.pop_front();
+        }
+
+        self.in_flight.push_back((self.commits, surrounding_text));
     }
 
+    /// The surrounding text the input method knows.
     fn surrounding_text(&self) -> Option<&ImeSurroundingText> {
-        self.surrounding_text.as_ref()
+        self.known.as_ref()
     }
 
     /// Follows the input method's own edits in the surrounding text it knows, in the protocol's
     /// order: the deletion around the selection, the commit string in its place, and a new
     /// preedit, which replaces the selection and is not part of surrounding text. Until the
-    /// application sends its next state, a following deletion counts from there. If the edits do
-    /// not fit the text, it is no longer known.
+    /// next acknowledged commit, a following deletion counts from there. If the edits do not fit
+    /// the text, it is no longer known.
     fn edited(&mut self, delete: Option<(usize, usize)>, commit: Option<&str>, composing: bool) {
         if delete.is_none() && commit.is_none() && !composing {
             return;
         }
 
-        self.surrounding_text = self.surrounding_text.take().and_then(|surrounding| {
+        self.known = self.known.take().and_then(|surrounding| {
             let selection_start = surrounding.cursor().min(surrounding.anchor());
             let selection_end = surrounding.cursor().max(surrounding.anchor());
             let (before, after) = delete.unwrap_or_default();
             let start = selection_start.checked_sub(before)?;
             let end = selection_end.checked_add(after)?;
+            let offset = surrounding.offset();
             let mut text = surrounding.into_text();
 
             if end > text.len() || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
@@ -380,7 +429,7 @@ impl Sync {
             let commit = commit.unwrap_or_default();
             text.replace_range(start..end, commit);
             let cursor = start + commit.len();
-            ImeSurroundingText::new(text, cursor, cursor).ok()
+            ImeSurroundingText::new(text, cursor, cursor).ok().map(|text| text.with_offset(offset))
         });
     }
 }
@@ -615,10 +664,18 @@ delegate_dispatch!(WinitState: [ZwpTextInputV3: TextInputData] => TextInputState
 mod tests {
     use winit_core::window::ImeSurroundingText;
 
-    use super::Sync;
+    use super::{MAX_IN_FLIGHT, Sync};
 
     fn surrounding(text: &str, cursor: usize, anchor: usize) -> ImeSurroundingText {
         ImeSurroundingText::new(text.into(), cursor, anchor).unwrap()
+    }
+
+    /// A text input that has sent `text` in its first commit and seen it acknowledged.
+    fn acknowledged(text: ImeSurroundingText) -> Sync {
+        let mut sync = Sync::default();
+        sync.committed(Some(text));
+        sync.done(1);
+        sync
     }
 
     #[test]
@@ -627,9 +684,11 @@ mod tests {
         assert!(sync.may_send());
         sync.committed(Some(surrounding("abcdef", 6, 6)));
 
-        // Commit 1 is not acknowledged yet: the caret move waits.
+        // Commit 1 is not acknowledged yet: the caret move waits, and the input method knows no
+        // text yet.
         assert!(!sync.may_send());
         assert!(!sync.flush_due());
+        assert_eq!(sync.surrounding_text(), None);
 
         // A `done` for an older commit changes nothing.
         sync.done(0);
@@ -637,32 +696,67 @@ mod tests {
 
         sync.done(1);
         assert!(sync.flush_due());
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdef", 6, 6)));
         sync.committed(Some(surrounding("abcdef", 4, 4)));
         assert!(!sync.flush_due());
+    }
+
+    #[test]
+    fn events_for_an_older_commit_count_from_its_text() {
+        // The input method saw "abcdef|"; "abcd|ef" went out in commit 2. A deletion produced
+        // before the compositor passed on commit 2 arrives with serial 1 and still counts from
+        // the caret at 6.
+        let mut sync = acknowledged(surrounding("abcdef", 6, 6));
+        sync.committed(Some(surrounding("abcdef", 4, 4)));
+        sync.done(1);
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdef", 6, 6)));
+
+        // Once commit 2 is acknowledged, its text is the one the input method knows.
+        sync.done(2);
         assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdef", 4, 4)));
     }
 
     #[test]
     fn the_serial_wraps_with_the_commit_count() {
         let mut sync = Sync { commits: u32::MAX, done_serial: u32::MAX, ..Sync::default() };
-        sync.committed(None);
+        sync.committed(Some(surrounding("x", 1, 1)));
         assert_eq!(sync.commits, 0);
         assert!(!sync.may_send());
+
+        // Serial u32::MAX is before commit 0 and acknowledges nothing new.
+        sync.done(u32::MAX);
+        assert_eq!(sync.surrounding_text(), None);
         sync.done(0);
         assert!(sync.may_send());
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("x", 1, 1)));
+    }
+
+    #[test]
+    fn only_the_latest_unacknowledged_texts_are_kept() {
+        let mut sync = Sync::default();
+        for caret in 0..=MAX_IN_FLIGHT {
+            sync.committed(Some(surrounding("abcdefghi", caret, caret)));
+        }
+        assert_eq!(sync.in_flight.len(), MAX_IN_FLIGHT);
+
+        // Serial 1 named a text that was dropped; the input method's view is unknown.
+        sync.done(1);
+        assert_eq!(sync.surrounding_text(), None);
+        sync.done(2);
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdefghi", 1, 1)));
     }
 
     #[test]
     fn deletions_count_from_the_text_the_input_method_knows() {
-        let mut sync = Sync::default();
-        sync.committed(Some(surrounding("abcdef", 6, 6)));
+        let mut sync = acknowledged(surrounding("abcdef", 6, 6).with_offset(100));
 
-        // Delete "ef", then commit "X": a second deletion counts from after the "X".
+        // Delete "ef", then commit "X": a second deletion counts from after the "X", and the
+        // excerpt still starts where it did.
         sync.edited(Some((2, 0)), Some("X"), false);
-        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdX", 5, 5)));
+        assert_eq!(sync.surrounding_text(), Some(&surrounding("abcdX", 5, 5).with_offset(100)));
 
         // A composition replaces the selection and is not surrounding text.
-        sync.committed(Some(surrounding("abcdef", 2, 4)));
+        let mut sync = acknowledged(surrounding("abcdef", 2, 4));
         sync.edited(None, None, true);
         assert_eq!(sync.surrounding_text(), Some(&surrounding("abef", 2, 2)));
 
@@ -673,12 +767,11 @@ mod tests {
 
     #[test]
     fn edits_that_do_not_fit_forget_the_text() {
-        let mut sync = Sync::default();
-        sync.committed(Some(surrounding("ab", 1, 1)));
+        let mut sync = acknowledged(surrounding("ab", 1, 1));
         sync.edited(Some((2, 0)), None, false);
         assert_eq!(sync.surrounding_text(), None);
 
-        sync.committed(Some(surrounding("\u{e9}", 2, 2)));
+        let mut sync = acknowledged(surrounding("\u{e9}", 2, 2));
         sync.edited(Some((1, 0)), None, false);
         assert_eq!(sync.surrounding_text(), None, "a deletion inside a character");
     }

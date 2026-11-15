@@ -550,6 +550,15 @@ impl EventLoop {
         // This is always the last event we dispatch before poll again
         app.about_to_wait(&self.active_event_loop);
 
+        // The application has handled this iteration's input method events and requested any
+        // state they changed, so input method state held back while the input method was behind
+        // can go out now.
+        self.with_state(|state| {
+            for window in state.windows.get_mut().values() {
+                window.lock().unwrap().flush_held_text_input_state();
+            }
+        });
+
         // Update the window frames and schedule redraws.
         let mut wake_up = false;
         for window_id in window_ids.drain(..) {
