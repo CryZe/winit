@@ -89,12 +89,26 @@ pub trait EventLoopBuilderExtWayland {
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+
+    /// Whether this popup was created with an explicit Wayland seat grab.
+    ///
+    /// Keyboard focus can leave a grabbing popup while a submenu is being
+    /// replaced. Use the compositor's `WindowEvent::CloseRequested` to observe
+    /// dismissal and `WindowEvent::ToplevelActivationChanged` to observe an
+    /// application switch. This describes how the popup was created, including
+    /// after dismissal. Returns false for other windows and for passive popups.
+    fn uses_popup_grab(&self) -> bool;
 }
 
 impl WindowExtWayland for dyn CoreWindow + '_ {
     #[inline]
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>> {
         self.cast_ref::<Window>()?.xdg_toplevel()
+    }
+
+    #[inline]
+    fn uses_popup_grab(&self) -> bool {
+        self.cast_ref::<Popup>().is_some_and(|popup| popup.uses_popup_grab)
     }
 }
 
@@ -159,7 +173,13 @@ impl PlatformWindowAttributes for WindowAttributesWayland {
 /// Get the WindowId out of the surface.
 #[inline]
 fn make_wid(surface: &WlSurface) -> WindowId {
-    WindowId::from_raw(surface.id().as_ptr() as usize)
+    // libwayland may recycle a wl_proxy address as soon as a popup is destroyed.
+    // The per-surface user data stays alive in Rust surface handles, including
+    // the handle held until the application receives Destroyed.
+    let ptr = surface
+        .data::<sctk::compositor::SurfaceData<()>>()
+        .map_or_else(|| surface.id().as_ptr() as usize, |data| std::ptr::from_ref(data) as usize);
+    WindowId::from_raw(ptr)
 }
 
 /// Create a `DataTransferId` for the given data device and serial.

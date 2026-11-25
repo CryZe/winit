@@ -71,6 +71,13 @@ pub enum WindowEvent {
     /// - **iOS / Android / Web / Wayland:** Unsupported.
     Moved(PhysicalPosition<i32>),
 
+    /// The compositor changed the activation of this toplevel window.
+    ///
+    /// Currently emitted on Wayland. The toplevel can remain active while
+    /// one of its popups has keyboard focus. A configure that changes only
+    /// size or other state does not signal another activation.
+    ToplevelActivationChanged(bool),
+
     /// The window has been requested to close.
     CloseRequested,
 

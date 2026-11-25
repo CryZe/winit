@@ -324,35 +324,6 @@ impl EventLoop {
         self.single_iteration(app, cause);
     }
 
-    /// Recursive closing all windows from the child to the parent
-    fn find_windows_to_close(
-        window_id: &WindowId,
-        state: &mut WinitState,
-        out: &mut Vec<WindowId>,
-    ) -> bool {
-        if !state.window_requests.get_mut().get(window_id).unwrap().closed.load(Ordering::Relaxed) {
-            return false;
-        }
-
-        out.push(*window_id);
-        fn window_to_close(window_id: &WindowId, out: &mut Vec<WindowId>, state: &mut WinitState) {
-            // We don't need to check here if it should be closed, because if the parent should
-            // be closed all children must be closed as well
-            let Some(window_state) = state.windows.get_mut().get(window_id) else {
-                return;
-            };
-            let children = window_state.lock().unwrap().children().clone();
-            // First all children and then all subchildren
-            out.extend(&children);
-            for child in children.clone() {
-                window_to_close(&child, out, state);
-            }
-        }
-        window_to_close(window_id, out, state);
-
-        true
-    }
-
     fn single_iteration<A: ApplicationHandler>(&mut self, app: &mut A, cause: StartCause) {
         // NOTE currently just indented to simplify the diff
 
@@ -382,6 +353,11 @@ impl EventLoop {
 
         for mut compositor_update in compositor_updates.drain(..) {
             let window_id = compositor_update.window_id;
+            // Creating a replacement in an earlier callback can retire a window
+            // whose configure is already in this detached batch.
+            if !self.with_state(|state| state.windows.get_mut().contains_key(&window_id)) {
+                continue;
+            }
             if compositor_update.scale_changed {
                 let (physical_size, scale_factor) = self.with_state(|state| {
                     let windows = state.windows.get_mut();
@@ -401,6 +377,9 @@ impl EventLoop {
 
                 app.window_event(&self.active_event_loop, window_id, event);
 
+                if !self.with_state(|state| state.windows.get_mut().contains_key(&window_id)) {
+                    continue;
+                }
                 let physical_size = *new_surface_size.lock().unwrap();
                 drop(new_surface_size);
 
@@ -445,7 +424,18 @@ impl EventLoop {
                 app.window_event(&self.active_event_loop, window_id, event);
             }
 
-            if compositor_update.close_window {
+            if compositor_update.close_window
+                && self.with_state(|state| state.windows.get_mut().contains_key(&window_id))
+            {
+                // popup_done unmaps a Wayland popup. Keep the ordinary toplevel
+                // close request advisory, since the application may decline it.
+                self.with_state(|state| {
+                    if state.windows.get_mut()[&window_id].lock().unwrap().window.is_dismissed() {
+                        state.window_requests.get_mut()[&window_id]
+                            .closed
+                            .store(true, Ordering::Relaxed);
+                    }
+                });
                 app.window_event(&self.active_event_loop, window_id, WindowEvent::CloseRequested);
             }
         }
@@ -489,31 +479,14 @@ impl EventLoop {
             if self.with_state(|state| state.window_requests.get_mut().get(window_id).is_none()) {
                 continue; // The element might not exist anymore so just ignore
             }
-            let mut windows_to_close = Vec::new();
             if self.with_state(|state| {
-                Self::find_windows_to_close(window_id, state, &mut windows_to_close)
-            }) {
-                for w in windows_to_close.into_iter().rev() {
-                    self.with_state(|state| {
-                        let parent =
-                            state.windows.get_mut().get_mut(&w).unwrap().lock().unwrap().parent();
-
-                        if let Some(p) = parent.and_then(|p| state.windows.get_mut().get_mut(&p)) {
-                            p.lock().unwrap().remove_child(&w)
-                        }
-
-                        let window_requests = state.window_requests.get_mut();
-                        window_requests.get(&w).unwrap().take_closed();
-                        mem::drop(window_requests.remove(&w));
-                        mem::drop(state.windows.get_mut().remove(&w));
-                        // Creating a popup during an application callback can enqueue its
-                        // initial configure after this iteration has taken pending updates.
-                        // Remove updates for the destroyed window so the next iteration
-                        // cannot process them against the state we just removed.
-                        state.window_compositor_updates.retain(|update| update.window_id != w);
-                    });
-                    app.window_event(&self.active_event_loop, w, WindowEvent::Destroyed);
+                if state.window_requests.get_mut()[window_id].closed.load(Ordering::Relaxed) {
+                    state.retire_window(*window_id);
+                    true
+                } else {
+                    false
                 }
+            }) {
                 continue;
             }
 
@@ -540,6 +513,18 @@ impl EventLoop {
             if let Some(event) = event {
                 app.window_event(&self.active_event_loop, *window_id, event);
             }
+        }
+
+        // This also delivers destruction for popups retired synchronously by
+        // create_window. Hold their user data through each callback so an old
+        // Destroyed can never name a replacement, even within the same batch.
+        let retired = self.with_state(|state| mem::take(&mut state.retired_windows));
+        for surface in retired {
+            app.window_event(
+                &self.active_event_loop,
+                crate::make_wid(&surface),
+                WindowEvent::Destroyed,
+            );
         }
 
         // Reset the hint that we've dispatched events.

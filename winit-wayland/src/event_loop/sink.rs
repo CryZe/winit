@@ -37,6 +37,14 @@ impl EventSink {
         self.window_events.push(Event::WindowEvent { event, window_id });
     }
 
+    /// A roundtrip during popup creation can already have queued input for
+    /// a window that will never be published or whose role has been retired.
+    pub fn discard_window(&mut self, id: WindowId) {
+        self.window_events.retain(
+            |event| !matches!(event, Event::WindowEvent { window_id, .. } if *window_id == id),
+        );
+    }
+
     #[inline]
     pub fn append(&mut self, other: &mut Self) {
         self.window_events.append(&mut other.window_events);

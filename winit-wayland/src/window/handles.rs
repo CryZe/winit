@@ -132,10 +132,6 @@ pub struct WindowRequests {
 }
 
 impl WindowRequests {
-    pub fn take_closed(&self) -> bool {
-        self.closed.swap(false, Ordering::Relaxed)
-    }
-
     pub fn take_redraw_requested(&self) -> bool {
         self.redraw_requested.swap(false, Ordering::Relaxed)
     }

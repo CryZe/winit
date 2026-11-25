@@ -28,6 +28,8 @@ use crate::window::state::{WindowState, WindowType};
 
 #[derive(Debug)]
 pub struct Popup {
+    /// Whether creation sent an explicit xdg_popup.grab for this surface.
+    pub(crate) uses_popup_grab: bool,
     common: WindowCommon,
 }
 
@@ -49,9 +51,12 @@ impl Popup {
         let xdg_activation =
             state.xdg_activation.as_ref().map(|activation_state| activation_state.global().clone());
         let xdg_positioner = XdgPositioner::new(&state.xdg_shell).map_err(|e| os_error!(e))?;
-        let parent_window_id = WindowId::from_raw(parent_window_handle.surface.as_ptr() as usize);
-        let window_states = state.windows.borrow();
-        let Some(parent_window_state) = window_states.get(&parent_window_id) else {
+        // A callback may drop a subtree and immediately reuse its parent.
+        // Release those protocol roles before looking up the new parent.
+        state.retire_dropped_windows();
+        let Some((parent_window_id, parent_window_state)) =
+            state.window_for_surface(parent_window_handle)
+        else {
             return Err(InvalidInput::new("Unknown parent window id").into());
         };
 
@@ -63,9 +68,41 @@ impl Popup {
             constraint_adjustment,
             ..
         } = attributes.positioner.unwrap_or_default();
-        let grab_keyboard = attributes.active;
-
         let mut parent_window_state = parent_window_state.lock().unwrap();
+        if parent_window_state.window.is_dismissed() {
+            return Err(CreateWindowError::PopupDismissed);
+        }
+
+        let popup_parent = matches!(parent_window_state.window, WindowType::Popup { .. });
+        let grab = if attributes.active {
+            // Nested grabs must use their parent's seat. A passive parent
+            // (including one opened before the first input serial) can only
+            // have passive children, even if a serial has since arrived.
+            state
+                .seat_state
+                .seats()
+                .filter_map(|seat| {
+                    let seat_state = state.seats.get(&seat.id())?;
+                    if popup_parent && !seat_state.popup_grabs.contains(&parent_window_id) {
+                        return None;
+                    }
+                    Some((seat, seat_state.latest_serial()?))
+                })
+                .max_by_key(|(_, serial)| *serial)
+        } else {
+            None
+        };
+        if let Some((seat, _)) = &grab {
+            if state.seats[&seat.id()]
+                .popup_grabs
+                .last()
+                .is_some_and(|top| *top != parent_window_id)
+            {
+                return Err(
+                    InvalidInput::new("Popup parent is not the topmost grab on this seat").into()
+                );
+            }
+        }
 
         // Use the scale factor and xdg geometry of the parent.
         let scale_factor = parent_window_state.scale_factor();
@@ -133,7 +170,6 @@ impl Popup {
         .map_err(|e| os_error!(e))?;
         parent_window_state.add_child(super::make_wid(popup.wl_surface()));
         drop(parent_window_state);
-        drop(window_states);
 
         let mut popup_state = WindowState::new(
             event_loop_window_target,
@@ -143,6 +179,7 @@ impl Popup {
                 popup: popup.clone(),
                 xdg_positioner,
                 last_configure: None,
+                dismissed: false,
                 parent_origin: geometry_origin,
                 positioner: WindowPositioner::new(
                     anchor,
@@ -175,23 +212,11 @@ impl Popup {
             xdg_activation.activate(token.into_raw(), &surface);
         }
 
-        // Request a keyboard grab so the compositor routes key events to
-        // this popup rather than the parent window. Must happen before the
-        // first commit that maps the surface.
-        if grab_keyboard {
-            // Use the seat with the most recent event
-            let grab = state
-                .seat_state
-                .seats()
-                .filter_map(|seat| {
-                    let serial = state.seats.get(&seat.id())?.latest_serial()?;
-                    Some((seat, serial))
-                })
-                .max_by_key(|(_, serial)| *serial);
-
-            if let Some((seat, serial)) = grab {
-                popup.xdg_popup().grab(&seat, serial);
-            }
+        let window_id = super::make_wid(popup.wl_surface());
+        let uses_popup_grab = grab.is_some();
+        if let Some((seat, serial)) = grab {
+            popup.xdg_popup().grab(&seat, serial);
+            state.seats.get_mut(&seat.id()).unwrap().popup_grabs.push(window_id);
         }
 
         // Do initial commit
@@ -199,7 +224,6 @@ impl Popup {
 
         let popup_state = Arc::new(Mutex::new(popup_state));
 
-        let window_id = super::make_wid(popup.wl_surface());
         state.windows.get_mut().insert(window_id, popup_state.clone());
 
         let window_requests = WindowRequests {
@@ -214,24 +238,25 @@ impl Popup {
 
         let mut wayland_source = event_loop_window_target.wayland_dispatcher.as_source_mut();
         let event_queue = wayland_source.queue();
-        // Do a roundtrip.
-        event_queue.roundtrip(&mut state).map_err(|err| os_error!(err))?;
-
-        // XXX Wait for the initial configure to arrive.
-        while !popup_state.lock().unwrap().is_configured() {
-            event_queue.blocking_dispatch(&mut state).map_err(|err| os_error!(err))?;
-            // The compositor may dismiss a popup (e.g. invalid grab serial) by sending
-            // popup_done before configure. Detect that and bail out instead of looping forever.
-            if state
-                .window_compositor_updates
-                .iter()
-                .any(|u| u.window_id == window_id && u.close_window)
-            {
-                return Err(os_error!(PopupError(
-                    "Popup was dismissed by the compositor before configure"
-                ))
-                .into());
+        let configured = (|| -> Result<(), CreateWindowError> {
+            event_queue.roundtrip(&mut state).map_err(|err| os_error!(err))?;
+            loop {
+                // The roundtrip itself can deliver popup_done before configure.
+                let window = popup_state.lock().unwrap();
+                if window.window.is_dismissed() {
+                    return Err(CreateWindowError::PopupDismissed);
+                }
+                if window.is_configured() {
+                    return Ok(());
+                }
+                drop(window);
+                event_queue.blocking_dispatch(&mut state).map_err(|err| os_error!(err))?;
             }
+        })();
+        if let Err(error) = configured {
+            // No public window was returned, so there is no Destroyed to emit.
+            state.remove_window(window_id);
+            return Err(error);
         }
 
         // Wake-up event loop, so it'll send initial redraw requested.
@@ -239,6 +264,7 @@ impl Popup {
         event_loop_awakener.ping();
 
         Ok(Self {
+            uses_popup_grab,
             common: WindowCommon {
                 state: Arc::downgrade(&popup_state),
                 window_id,

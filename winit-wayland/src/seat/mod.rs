@@ -80,6 +80,9 @@ pub struct WinitSeatState {
     /// Whether we have pending modifiers.
     modifiers_pending: bool,
 
+    /// Explicit xdg_popup grabs on this seat, in nesting order.
+    pub(crate) popup_grabs: Vec<winit_core::window::WindowId>,
+
     /// Serial of the most recent input event (keyboard or pointer) on this seat.
     /// Written by both keyboard and pointer handlers through a shared reference,
     /// so interior mutability is required.

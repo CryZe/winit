@@ -23,6 +23,7 @@ use sctk::shm::slot::SlotPool;
 use sctk::shm::{Shm, ShmHandler};
 use sctk::subcompositor::SubcompositorState;
 use winit_core::error::OsError;
+use winit_core::event::WindowEvent;
 
 use crate::WindowId;
 use crate::dnd::DndState;
@@ -67,6 +68,10 @@ pub struct WinitState {
 
     /// The currently present windows.
     pub windows: RefCell<HashMap<WindowId, Arc<Mutex<WindowState>>>>,
+
+    /// Protocol roles have been released, but Destroyed must be delivered from
+    /// the event loop rather than reentering the application during create_window.
+    pub retired_windows: Vec<WlSurface>,
 
     /// The requests from the `Window` to EventLoop, such as close operations and redraw requests.
     pub window_requests: RefCell<HashMap<WindowId, Arc<WindowRequests>>>,
@@ -208,6 +213,7 @@ impl WinitState {
             image_pool,
 
             windows: Default::default(),
+            retired_windows: Vec::new(),
             window_requests: Default::default(),
             window_compositor_updates: Vec::new(),
             window_events_sink: Default::default(),
@@ -281,6 +287,65 @@ impl WinitState {
         }
     }
 
+    pub fn window_for_surface(
+        &self,
+        raw: &rwh_06::WaylandWindowHandle,
+    ) -> Option<(WindowId, Arc<Mutex<WindowState>>)> {
+        self.windows.borrow().iter().find_map(|(id, state)| {
+            let ptr = state.lock().unwrap().window.wl_surface().id().as_ptr();
+            (ptr.cast() == raw.surface.as_ptr()).then(|| (*id, state.clone()))
+        })
+    }
+
+    /// Retire a subtree newest child first. Dropping the last WindowState puts
+    /// xdg_popup.destroy on the wire before a replacement can request its grab.
+    pub fn retire_window(&mut self, id: WindowId) {
+        let children = match self.windows.get_mut().get(&id) {
+            Some(window) => window.lock().unwrap().take_children(),
+            None => return,
+        };
+        for child in children.into_iter().rev() {
+            self.retire_window(child);
+        }
+        if let Some(surface) = self.remove_window(id) {
+            self.retired_windows.push(surface);
+        }
+    }
+
+    /// Detach a leaf from the event-loop registry and release its protocol role.
+    /// The surface handle retains the identity, without retaining the role.
+    pub fn remove_window(&mut self, id: WindowId) -> Option<WlSurface> {
+        let window = self.windows.get_mut().remove(&id)?;
+        let window = window.lock().unwrap();
+        debug_assert!(window.children().is_empty());
+        if let Some(parent) = window.parent().and_then(|p| self.windows.get_mut().get(&p)) {
+            parent.lock().unwrap().remove_child(&id);
+        }
+        for seat in self.seats.values_mut() {
+            seat.popup_grabs.retain(|grabbed| *grabbed != id);
+        }
+        self.events_sink.discard_window(id);
+        self.window_events_sink.lock().unwrap().discard_window(id);
+        self.window_requests.get_mut().remove(&id);
+        self.window_compositor_updates.retain(|update| update.window_id != id);
+        Some(window.window.wl_surface().clone())
+    }
+
+    /// A replacement may be created before the regular event-loop destruction
+    /// pass. Include dropped ancestors: their whole subtree must be unmapped,
+    /// even if the application still holds a handle to a descendant.
+    pub fn retire_dropped_windows(&mut self) {
+        let dropped: Vec<_> = self
+            .window_requests
+            .get_mut()
+            .iter()
+            .filter_map(|(&id, requests)| requests.closed.load(Ordering::Relaxed).then_some(id))
+            .collect();
+        for id in dropped {
+            self.retire_window(id);
+        }
+    }
+
     pub fn queue_close(updates: &mut Vec<WindowCompositorUpdate>, window_id: WindowId) {
         let pos = if let Some(pos) = updates.iter().position(|update| update.window_id == window_id)
         {
@@ -333,7 +398,10 @@ impl WindowHandler for WinitState {
             .expect("got configure for dead window.")
             .lock()
             .unwrap()
-            .configure_window(configure, &self.shm, &self.subcompositor_state);
+            .configure_window(configure, &self.shm, &self.subcompositor_state, |active| {
+                self.events_sink
+                    .push_window_event(WindowEvent::ToplevelActivationChanged(active), window_id);
+            });
 
         // NOTE: configure demands wl_surface::commit, however winit doesn't commit on behalf of the
         // users, since it can break a lot of things, thus it'll ask users to redraw instead.
@@ -392,9 +460,16 @@ impl PopupHandler for WinitState {
 
     fn done(&mut self, _: &Connection, _: &QueueHandle<Self>, popup: &XdgPopup) {
         let window_id = super::make_wid(popup.wl_surface());
-        let window_requests = self.window_requests.get_mut().iter().find(|r| *r.0 == window_id);
-        if let Some(window_requests) = window_requests {
-            window_requests.1.closed.store(true, Ordering::Relaxed);
+        let Some(window) = self.windows.get_mut().get(&window_id) else { return };
+        if let crate::window::state::WindowType::Popup { dismissed, .. } =
+            &mut window.lock().unwrap().window
+        {
+            *dismissed = true;
+        }
+        // The compositor has already removed the grab. Deliver CloseRequested
+        // before retiring a window whose application handle is still live.
+        for seat in self.seats.values_mut() {
+            seat.popup_grabs.retain(|id| *id != window_id);
         }
         Self::queue_close(&mut self.window_compositor_updates, window_id);
     }

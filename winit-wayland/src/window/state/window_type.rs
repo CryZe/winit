@@ -17,6 +17,9 @@ pub enum WindowType {
         popup: Popup,
         xdg_positioner: XdgPositioner,
         last_configure: Option<PopupConfigure>,
+        /// The popup is already unmapped once popup_done arrives, even while
+        /// its CloseRequested callback is waiting to be delivered.
+        dismissed: bool,
         parent_origin: LogicalPosition<i32>,
 
         positioner: WindowPositioner,
@@ -24,6 +27,10 @@ pub enum WindowType {
 }
 
 impl WindowType {
+    pub fn is_dismissed(&self) -> bool {
+        matches!(self, Self::Popup { dismissed: true, .. })
+    }
+
     pub fn is_configured(&self) -> bool {
         match self {
             Self::Window { last_configure, .. } => last_configure.is_some(),

@@ -183,12 +183,19 @@ impl WindowState {
         configure: WindowConfigure,
         shm: &Shm,
         subcompositor: &Option<Arc<SubcompositorState>>,
+        activation_changed: impl FnOnce(bool),
     ) -> bool {
         let new_size = self.configure_frame_and_size(&configure, shm, subcompositor);
 
         let new_state = configure.state;
         if let WindowType::Window { last_configure, .. } = &mut self.window {
             let old_state = last_configure.as_ref().map(|configure| configure.state);
+
+            // Keyboard focus follows the grabbed popup; toplevel activation
+            // follows the window family, including during submenu replacement.
+            if let Some(active) = activation_change(old_state, new_state) {
+                activation_changed(active);
+            }
 
             let state_change_requires_resize = old_state
                 .map(|old_state| {
@@ -216,5 +223,28 @@ impl WindowState {
             );
             false
         }
+    }
+}
+
+/// Initial inactive and size-only configures do not mark an interaction boundary.
+fn activation_change(previous: Option<XdgWindowState>, current: XdgWindowState) -> Option<bool> {
+    let active = current.contains(XdgWindowState::ACTIVATED);
+    (previous.is_some_and(|state| state.contains(XdgWindowState::ACTIVATED)) != active)
+        .then_some(active)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_toplevel_activation_transitions_are_reported() {
+        let inactive = XdgWindowState::empty();
+        let active = XdgWindowState::ACTIVATED;
+        assert_eq!(activation_change(None, inactive), None);
+        assert_eq!(activation_change(None, active), Some(true));
+        assert_eq!(activation_change(Some(active), active | XdgWindowState::MAXIMIZED), None);
+        assert_eq!(activation_change(Some(active), inactive), Some(false));
+        assert_eq!(activation_change(Some(inactive), inactive), None);
     }
 }

@@ -810,6 +810,10 @@ impl WindowState {
         &self.children
     }
 
+    pub fn take_children(&mut self) -> Vec<WindowId> {
+        std::mem::take(&mut self.children)
+    }
+
     pub fn parent(&self) -> Option<WindowId> {
         self.parent
     }
